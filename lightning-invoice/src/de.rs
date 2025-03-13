@@ -9,9 +9,9 @@ use core::str::FromStr;
 use std::error;
 
 use bech32::primitives::decode::{CheckedHrpstring, CheckedHrpstringError};
-use bech32::{Bech32, Fe32, Fe32IterExt};
+use bech32::{Fe32, Fe32IterExt};
 
-use crate::prelude::*;
+use crate::{prelude::*, Bolt11Bech32};
 use bitcoin::hashes::sha256;
 use bitcoin::hashes::Hash;
 use bitcoin::{PubkeyHash, ScriptHash, WitnessVersion};
@@ -377,7 +377,7 @@ impl FromStr for SignedRawBolt11Invoice {
 	type Err = Bolt11ParseError;
 
 	fn from_str(s: &str) -> Result<Self, Self::Err> {
-		let parsed = CheckedHrpstring::new::<Bech32>(s)?;
+		let parsed = CheckedHrpstring::new::<Bolt11Bech32>(s)?;
 		let hrp = parsed.hrp();
 		// Access original non-packed 32 byte values (as Fe32s)
 		// Note: the type argument is needed due to the API peculiarities, but it's not used
