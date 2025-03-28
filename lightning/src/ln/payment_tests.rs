@@ -4480,15 +4480,103 @@ fn pay_route_without_params() {
 	);
 }
 
+mod lexe_configs {
+    use crate::util::config::{ChannelConfig, ChannelHandshakeConfig, ChannelHandshakeLimits, MaxDustHTLCExposure, UserConfig};
+
+	pub(super) fn lexe_user_config() -> UserConfig {
+		UserConfig {
+			channel_handshake_config: ChannelHandshakeConfig {
+				minimum_depth: 3,
+				our_to_self_delay: 432,
+				our_htlc_minimum_msat: 1,
+				max_inbound_htlc_value_in_flight_percent_of_channel: 100,
+				negotiate_scid_privacy: true,
+				announce_for_forwarding: false,
+				commit_upfront_shutdown_pubkey: false,
+				their_channel_reserve_proportional_millionths: 10000,
+				negotiate_anchors_zero_fee_htlc_tx: false,
+				our_max_accepted_htlcs: 483,
+			},
+			channel_handshake_limits: ChannelHandshakeLimits {
+				min_funding_satoshis: 5000,
+				max_funding_satoshis: 500000000,
+				max_htlc_minimum_msat: 18446744073709551615,
+				min_max_htlc_value_in_flight_msat: 0,
+				max_channel_reserve_satoshis: 18446744073709551615,
+				min_max_accepted_htlcs: 0,
+				max_minimum_depth: 144,
+				trust_own_funding_0conf: true,
+				force_announced_channel_preference: false,
+				their_to_self_delay: 2016,
+			},
+			channel_config: ChannelConfig {
+				forwarding_fee_proportional_millionths: 3000,
+				forwarding_fee_base_msat: 0,
+				cltv_expiry_delta: 72,
+				max_dust_htlc_exposure: MaxDustHTLCExposure::FixedLimitMsat(1000000000),
+				force_close_avoidance_max_fee_satoshis: 1000,
+				accept_underpaying_htlcs: false,
+			},
+			accept_forwards_to_priv_channels: true,
+			accept_inbound_channels: true,
+			manually_accept_inbound_channels: false,
+			accept_intercept_htlcs: true,
+			manually_handle_bolt12_invoices: false,
+		}
+	}
+
+	pub(super) fn lsp_config() -> UserConfig {
+		UserConfig {
+			channel_handshake_config: ChannelHandshakeConfig {
+				minimum_depth: 3,
+				our_to_self_delay: 1008,
+				our_htlc_minimum_msat: 1,
+				max_inbound_htlc_value_in_flight_percent_of_channel: 100,
+				negotiate_scid_privacy: true,
+				announce_for_forwarding: false,
+				commit_upfront_shutdown_pubkey: false,
+				their_channel_reserve_proportional_millionths: 10000,
+				negotiate_anchors_zero_fee_htlc_tx: false,
+				our_max_accepted_htlcs: 50,
+			},
+			channel_handshake_limits: ChannelHandshakeLimits {
+				min_funding_satoshis: 0,
+				max_funding_satoshis: 500000000,
+				max_htlc_minimum_msat: 18446744073709551615,
+				min_max_htlc_value_in_flight_msat: 0,
+				max_channel_reserve_satoshis: 18446744073709551615,
+				min_max_accepted_htlcs: 0,
+				max_minimum_depth: 144,
+				trust_own_funding_0conf: true,
+				force_announced_channel_preference: true,
+				their_to_self_delay: 576,
+			},
+			channel_config: ChannelConfig {
+				forwarding_fee_proportional_millionths: 0,
+				forwarding_fee_base_msat: 0,
+				cltv_expiry_delta: 42,
+				max_dust_htlc_exposure: MaxDustHTLCExposure::FixedLimitMsat(100000000),
+				force_close_avoidance_max_fee_satoshis: 1000,
+				accept_underpaying_htlcs: true,
+			},
+			accept_forwards_to_priv_channels: false,
+			accept_inbound_channels: true,
+			manually_accept_inbound_channels: false,
+			accept_intercept_htlcs: false,
+			manually_handle_bolt12_invoices: false,
+		}
+	}
+}
+
 #[test]
 fn xxx() {
-	let mut cfg = test_default_channel_config();
-	cfg.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
-	let mut high_fee_cfg = cfg.clone();
-	high_fee_cfg.channel_config.forwarding_fee_base_msat = 1_050_000;
+	let user_cfg = lexe_configs::lexe_user_config();
+	let lsp_cfg = lexe_configs::lsp_config();
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
-	let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[Some(cfg.clone()), Some(high_fee_cfg.clone()), Some(cfg.clone())]);
+	let node_chanmgrs = create_node_chanmgrs(
+        3, &node_cfgs, &[Some(user_cfg.clone()), Some(lsp_cfg.clone()), Some(user_cfg.clone())]
+    );
 	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
 	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 200_000, 0);
