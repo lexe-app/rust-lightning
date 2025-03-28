@@ -3167,27 +3167,6 @@ where L::Target: Logger {
 					}
 					debug_assert!(*used_liquidity_msat <= hop_max_msat);
 				}
-
-				// NOTE: The original motivation for the block was to ensure MPPs vary their paths a
-				// bit by disabling the 'central' hop in any found paths. However, we are disabling
-				// this block, as it:
-				//
-				// 1) causes MPP routing failures if there is only one path from payer -> payee
-				// 2) forces MPPs to be routed across multiple paths; the additional paths are
-				//    usually more expensive and less reliable (less liquidity).
-				//
-				// Issue: https://github.com/lightningdevkit/rust-lightning/issues/3685
-				//
-				// The one possible privacy concern is that any hops which forward multiple shards
-				// of the same MPP can link those shards together, as each shard uses the same
-				// payment hash (since LDK implements Simplified Multipath Payments, not Atomic
-				// Multipath Payments). But this concern seems moot, as sending the payment over a
-				// single shard leaks almost the same information anyway.
-				//
-				// As far as I (and SOTA AI models) can tell, disabling this block doesn't violate
-				// any correctness constraints or security concerns in surrounding code.
-				let _ = prevented_redundant_path_selection;
-				/*
 				if !prevented_redundant_path_selection {
 					// If we weren't capped by hitting a liquidity limit on a channel in the path,
 					// we'll probably end up picking the same path again on the next iteration.
@@ -3202,7 +3181,6 @@ where L::Target: Logger {
 						*used_liquidities.entry(CandidateHopId::Clear((scid, true))).or_default() = exhausted;
 					}
 				}
-				*/
 
 				// Track the total amount all our collected paths allow to send so that we know
 				// when to stop looking for more paths
