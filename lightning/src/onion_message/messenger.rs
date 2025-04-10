@@ -52,7 +52,7 @@ use {
 	crate::sync::Arc,
 };
 
-pub(super) const MAX_TIMER_TICKS: usize = 2;
+pub(super) const MAX_TIMER_TICKS: usize = 3;
 
 /// A trivial trait which describes any [`OnionMessenger`].
 ///
