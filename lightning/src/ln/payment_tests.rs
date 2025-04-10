@@ -4566,3 +4566,57 @@ fn max_out_mpp_path() {
 	check_added_monitors(&nodes[0], 2); // one monitor update per MPP part
 	nodes[0].node.get_and_clear_pending_msg_events();
 }
+
+#[test]
+fn repro_too_many_shards() {
+	let mut user_cfg = test_default_channel_config();
+	user_cfg.channel_config.forwarding_fee_base_msat = 0;
+	user_cfg.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+	let mut lsp_cfg = test_default_channel_config();
+	lsp_cfg.channel_config.forwarding_fee_base_msat = 0;
+	lsp_cfg.channel_config.forwarding_fee_proportional_millionths = 3000;
+	lsp_cfg.channel_handshake_config.max_inbound_htlc_value_in_flight_percent_of_channel = 100;
+
+	let chanmon_cfgs = create_chanmon_cfgs(3);
+	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(
+		3, &node_cfgs, &[Some(user_cfg.clone()), Some(lsp_cfg.clone()), Some(user_cfg.clone())],
+	);
+
+	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 100_000, 0);
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 200_000, 0);
+	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 300_000, 0);
+	create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 600_000, 0);
+
+	let amt_msat = 585_000_000;
+	let expiry_secs = 60 * 60;
+	let (payment_hash, payment_secret) = nodes[1].node.create_inbound_payment(Some(amt_msat), expiry_secs, None).unwrap();
+
+	let payment_params = PaymentParameters::from_node_id(nodes[1].node.get_our_node_id(), TEST_FINAL_CLTV)
+		.with_bolt11_features(nodes[1].node.bolt11_invoice_features()).unwrap();
+	let scorer = test_utils::TestScorer::new();
+	let keys_manager = test_utils::TestKeysInterface::new(&[0u8; 32], Network::Testnet);
+	let random_seed_bytes = keys_manager.get_secure_random_bytes();
+	let route_params = RouteParameters::from_payment_params_and_value(payment_params, amt_msat);
+	let route = get_route( &nodes[0].node.get_our_node_id(), &route_params,
+		&nodes[0].network_graph.read_only(),
+		Some(&nodes[0].node.list_usable_channels().iter().collect::<Vec<_>>()), nodes[0].logger,
+		&scorer, &Default::default(), &random_seed_bytes).unwrap();
+    assert_eq!(route.paths.len(), 3);
+
+	nodes[0].node.send_payment_with_route(route, payment_hash,
+		RecipientOnionFields::secret_only(payment_secret), PaymentId(payment_hash.0)).unwrap();
+	check_added_monitors!(nodes[0], 3);
+
+	// Make sure to use `get_payment_preimage`
+	let payment_preimage = nodes[1].node.get_payment_preimage(payment_hash, payment_secret).unwrap();
+	let mut events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(events.len(), 3);
+	// pass_along_path(&nodes[0], &[&nodes[1]], amt_msat, payment_hash, Some(payment_secret), events.pop().unwrap(), true, Some(payment_preimage));
+	// claim_payment_along_route(
+	// 	ClaimAlongRouteArgs::new(&nodes[0], &[&[&nodes[1]]], payment_preimage)
+	// );
+}
+
