@@ -4544,7 +4544,7 @@ fn max_out_mpp_path() {
 	let chanmon_cfgs = create_chanmon_cfgs(3);
 	let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
 	let node_chanmgrs = create_node_chanmgrs(
-		3, &node_cfgs, &[Some(user_cfg.clone()), Some(lsp_cfg.clone()), Some(user_cfg.clone())]
+		3, &node_cfgs, &[Some(user_cfg.clone()), Some(lsp_cfg.clone()), Some(user_cfg.clone())],
 	);
 	let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
 
@@ -4552,15 +4552,29 @@ fn max_out_mpp_path() {
 	create_unannounced_chan_between_nodes_with_value(&nodes, 0, 1, 300_000, 0);
 	create_unannounced_chan_between_nodes_with_value(&nodes, 1, 2, 600_000, 0);
 
-	let amt_msat = 350_000_000;
+	let amt_msat = 450_000_000;
 	let invoice_params = crate::ln::channelmanager::Bolt11InvoiceParameters {
 		amount_msats: Some(amt_msat),
 		..Default::default()
 	};
 	let invoice = nodes[2].node.create_bolt11_invoice(invoice_params).unwrap();
-	let route_params_cfg = crate::routing::router::RouteParametersConfig::default();
+	let mut route_params_cfg = crate::routing::router::RouteParametersConfig::default();
 
-	nodes[0].node.pay_for_bolt11_invoice(&invoice, PaymentId([42; 32]), None, route_params_cfg, Retry::Attempts(0)).unwrap();
+	// Set max_path_count to channel_manager.list_usable_channels().len();
+	route_params_cfg.max_path_count = 2;
+	// Worth tweaking this; wasn't necessary to reproduce the error though.
+	// route_params_cfg.max_channel_saturation_power_of_half = 0;
+
+	nodes[0]
+		.node
+		.pay_for_bolt11_invoice(
+			&invoice,
+			PaymentId([42; 32]),
+			None,
+			route_params_cfg,
+			Retry::Attempts(0),
+		)
+		.unwrap();
 
 	assert!(nodes[0].node.list_recent_payments().len() == 1);
 	check_added_monitors(&nodes[0], 2); // one monitor update per MPP part
