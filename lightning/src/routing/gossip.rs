@@ -2351,6 +2351,13 @@ where
 			return;
 		}
 		let min_time_unix: u32 = (current_time_unix - STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS) as u32;
+		// NOTE(phlip9): LSP network graph is like 7x larger than it should be
+		// (2025-09-12: 300k total chan vs 44k live chan). LDK is correctly
+		// marking channels with no recent updates (i.e., one_to_two and
+		// two_to_one are both None/pruned), but isn't actually pruning the
+		// channel soon enough. We'll reduce the time-to-prune for channels with
+		// no recent updates to 2 days since last gossip announcement.
+		let min_time_announce_unix: u32 = (current_time_unix - (5 * 24 * 60 * 60)) as u32;
 		// Sadly BTreeMap::retain was only stabilized in 1.53 so we can't switch to it for some
 		// time.
 		let mut scids_to_remove = Vec::new();
@@ -2374,9 +2381,9 @@ where
 				// announcements that we just received and are just waiting for our peer to send a
 				// channel_update for.
 				let announcement_received_timestamp = info.announcement_received_time;
-				if announcement_received_timestamp < min_time_unix as u64 {
+				if announcement_received_timestamp < min_time_announce_unix as u64 {
 					log_gossip!(self.logger, "Removing channel {} because both directional updates are missing and its announcement timestamp {} being below {}",
-						scid, announcement_received_timestamp, min_time_unix);
+						scid, announcement_received_timestamp, min_time_announce_unix);
 					scids_to_remove.push(*scid);
 				}
 			}
