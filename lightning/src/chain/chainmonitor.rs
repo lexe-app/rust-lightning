@@ -507,7 +507,8 @@ where C::Target: chain::Filter,
 		// Note that we only check for pending non-chainsync monitor updates and we don't track monitor
 		// updates resulting from chainsync in `pending_monitor_updates`.
 		let monitor_is_pending_updates = monitor_data.has_pending_updates(&pending_monitor_updates);
-		log_debug!(self.logger, "Completed off-chain monitor update {} for channel with funding outpoint {:?}, {}",
+		// NOTE(phlip9): logs too much during startup
+		log_trace!(self.logger, "Completed off-chain monitor update {} for channel with funding outpoint {:?}, {}",
 			completed_update_id,
 			funding_txo,
 			if monitor_is_pending_updates {
