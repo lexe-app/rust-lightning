@@ -417,7 +417,8 @@ impl<
 		L,
 		AsyncPersister<K, S, L, ES, SP, T, F>,
 		ES,
-	> where
+	>
+where
 	K::Target: KVStore + MaybeSync,
 	SP::Target: SignerProvider + Sized,
 	C::Target: chain::Filter,
@@ -790,7 +791,8 @@ where
 		// Note that we only check for pending non-chainsync monitor updates and we don't track monitor
 		// updates resulting from chainsync in `pending_monitor_updates`.
 		let monitor_is_pending_updates = monitor_data.has_pending_updates(&pending_monitor_updates);
-		log_debug!(
+		// NOTE(phlip9): logs too much during startup
+		log_trace!(
 			self.logger,
 			"Completed off-chain monitor update {} for channel with channel ID {}, {}",
 			completed_update_id,
