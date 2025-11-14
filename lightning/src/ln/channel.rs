@@ -11130,7 +11130,8 @@ where
 		};
 
 		if !need_commitment_update {
-			log_debug!(logger, "Not producing channel_ready: we do not need a commitment update");
+			// NOTE(phlip9): logs too much during startup
+			log_trace!(logger, "Not producing channel_ready: we do not need a commitment update");
 			return None;
 		}
 
