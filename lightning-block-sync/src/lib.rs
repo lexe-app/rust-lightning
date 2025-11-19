@@ -19,6 +19,9 @@
 #![deny(unsafe_code)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+// phlip9: silence lint
+#![allow(mismatched_lifetime_syntaxes)]
+
 #[cfg(any(feature = "rest-client", feature = "rpc-client"))]
 pub mod http;
 

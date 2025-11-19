@@ -47,6 +47,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// phlip9: silence lint
+#![allow(mismatched_lifetime_syntaxes)]
+
 #[macro_use]
 extern crate alloc;
 

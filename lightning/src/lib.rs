@@ -41,6 +41,9 @@
 #![allow(bare_trait_objects)]
 #![allow(ellipsis_inclusive_range_patterns)]
 
+// phlip9: silence lint
+#![allow(mismatched_lifetime_syntaxes)]
+
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]

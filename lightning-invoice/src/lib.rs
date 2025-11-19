@@ -8,6 +8,9 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![cfg_attr(all(not(feature = "std"), not(test)), no_std)]
 
+// phlip9: silence lint
+#![allow(mismatched_lifetime_syntaxes)]
+
 //! This crate provides data structures to represent
 //! [lightning BOLT11](https://github.com/lightning/bolts/blob/master/11-payment-encoding.md)
 //! invoices and functions to create, encode and decode these. If you just want to use the standard
