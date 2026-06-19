@@ -5647,6 +5647,49 @@ where
 		)
 	}
 
+	/// Pays the [`Bolt12Invoice`] associated with the `payment_id` encoded in its
+	/// `payer_metadata` along the given `route`, rather than having the [`Router`]
+	/// find one. See [`Self::send_payment_for_bolt12_invoice`] for the semantics
+	/// of invoice verification and [`Self::send_payment_with_route`] for the
+	/// semantics of paying along a fixed route (notably, LDK will not
+	/// automatically retry; re-send after an [`Event::PaymentFailed`]).
+	///
+	/// [`Event::PaymentFailed`]: events::Event::PaymentFailed
+	pub fn send_payment_for_bolt12_invoice_with_route(
+		&self, invoice: &Bolt12Invoice, context: Option<&OffersContext>, route: Route,
+	) -> Result<(), Bolt12PaymentError> {
+		match self.verify_bolt12_invoice(invoice, context) {
+			Ok(payment_id) => self
+				.send_payment_for_verified_bolt12_invoice_with_route(invoice, payment_id, route),
+			Err(()) => Err(Bolt12PaymentError::UnexpectedInvoice),
+		}
+	}
+
+	fn send_payment_for_verified_bolt12_invoice_with_route(
+		&self, invoice: &Bolt12Invoice, payment_id: PaymentId, route: Route,
+	) -> Result<(), Bolt12PaymentError> {
+		let best_block_height = self.best_block.read().unwrap().height;
+		let _persistence_guard = PersistenceNotifierGuard::notify_on_drop(self);
+		let features = self.bolt12_invoice_features();
+		let fixed_router = FixedRouter::new(route);
+		self.pending_outbound_payments.send_payment_for_bolt12_invoice(
+			invoice,
+			payment_id,
+			&&fixed_router,
+			self.list_usable_channels(),
+			features,
+			|| self.compute_inflight_htlcs(),
+			&self.entropy_source,
+			&self.node_signer,
+			&self,
+			&self.secp_ctx,
+			best_block_height,
+			&self.pending_events,
+			|args| self.send_payment_along_path(args),
+			&WithContext::from(&self.logger, None, None, None),
+		)
+	}
+
 	fn check_refresh_async_receive_offer_cache(&self, timer_tick_occurred: bool) {
 		let peers = self.get_peers_for_blinded_path();
 		let channels = self.list_usable_channels();
