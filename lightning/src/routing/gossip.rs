@@ -1672,8 +1672,10 @@ where
 
 		let chain_hash: ChainHash = Readable::read(reader)?;
 		let channels_count: u64 = Readable::read(reader)?;
-		// Pre-allocate 115% of the known channel count to avoid unnecessary reallocations.
-		let channels_map_capacity = (channels_count as u128 * 115 / 100)
+		// Pre-allocate + 2% of the known channel count to avoid unnecessary
+		// reallocations, but (hopefully) stay below next big HashMap threshold
+		// (cap=57345 -> buckets=131072).
+		let channels_map_capacity = (channels_count as u128 * 102 / 100)
 			.try_into()
 			.map(|v: usize| v.min(MAX_CHAN_COUNT_LIMIT))
 			.map_err(|_| DecodeError::InvalidValue)?;
@@ -1689,8 +1691,8 @@ where
 		if nodes_count > u32::max_value() as u64 / 2 {
 			return Err(DecodeError::InvalidValue);
 		}
-		// Pre-allocate 115% of the known channel count to avoid unnecessary reallocations.
-		let nodes_map_capacity: usize = (nodes_count as u128 * 115 / 100)
+		// Pre-allocate + 2% of the known nodes count to avoid unnecessary reallocations.
+		let nodes_map_capacity: usize = (nodes_count as u128 * 102 / 100)
 			.try_into()
 			.map(|v: usize| v.min(MAX_NODE_COUNT_LIMIT))
 			.map_err(|_| DecodeError::InvalidValue)?;
@@ -1770,16 +1772,42 @@ where
 	}
 }
 
-/// In Jan, 2026 there were about 54K channels.
-///
-/// We over-allocate by a bit because ~15% more is better than the double we get if we're slightly
-/// too low.
-const CHAN_COUNT_ESTIMATE: usize = 63_000;
-/// In Jan, 2026 there were about 17K nodes
-///
-/// We over-allocate by a bit because 15% more is better than the double we get if we're slightly
-/// too low.
-const NODE_COUNT_ESTIMATE: usize = 20_000;
+// NOTE(phlip9): useful sizes for reference (as of 2026-07-21)
+//
+// ChannelInfo: size=1024 align=128
+// ChannelUpdateInfo: size=192 align=32
+// NodeInfo: size=264 align=8
+// NodeAnnouncementInfo: size=232 align=8
+// NodeAnnouncementDetails: size=88 align=8
+// ChannelAnnouncement: size=480 align=8
+// UnsignedChannelAnnouncement: size=224 align=8
+// ChannelUpdate: size=160 align=8
+// UnsignedChannelUpdate: size=96 align=8
+// NodeAnnouncement: size=232 align=8
+// UnsignedNodeAnnouncement: size=168 align=8
+// NodeId: size=33 align=1
+//
+// (u64, ChannelInfo) size=1152
+// (NodeId, NodeInfo) size=304
+
+/// In July, 2026 there were about 53K channels.
+//
+// NOTE(phlip9): I'm intentionally choosing a value below the HashMap buckets
+// growth boundary to save memory.
+//
+// HashMap::with_capacity(cap) -> actual # buckets
+// adjusted_cap := (cap * 8) / 7
+// buckets := adjusted_cap.next_power_of_two()
+//
+// - cap=57000 -> adjusted_cap=65142 -> buckets=65536
+// - cap=58000 -> adjusted_cap=66285 -> buckets=131072
+pub const CHAN_COUNT_ESTIMATE: usize = 57_000;
+/// In July, 2026 there were about 17K nodes
+//
+// NOTE(phlip9): the estimate here doesn't matter as much, both because NodeInfo
+// is smaller and all values between ~15K->28K get the same # of HashMap buckets
+// (32768 buckets).
+pub const NODE_COUNT_ESTIMATE: usize = 20_000;
 
 impl<L: Deref> NetworkGraph<L>
 where
