@@ -7988,7 +7988,6 @@ where
 			total_fee_satoshis += (-value_to_counterparty) as u64;
 		}
 
-		debug_assert!(value_to_counterparty >= 0);
 		if value_to_counterparty < 0 {
 			return Err(ChannelError::close(format!(
 				"Value to counterparty below 0: {}",
@@ -8001,7 +8000,6 @@ where
 			value_to_counterparty = 0;
 		}
 
-		debug_assert!(value_to_holder >= 0);
 		if value_to_holder < 0 {
 			return Err(ChannelError::close(format!(
 				"Value to holder below 0: {}",
