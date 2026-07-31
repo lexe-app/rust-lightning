@@ -15,6 +15,7 @@ use crate::chain::ChannelMonitorUpdateStatus;
 use crate::events::{ClosureReason, Event, HTLCHandlingFailureReason, HTLCHandlingFailureType};
 use crate::ln::channel_state::{ChannelDetails, ChannelShutdownState};
 use crate::ln::channelmanager::{self, PaymentId};
+use crate::ln::htlc_reserve_unit_tests::setup_0reserve_no_outputs_channels;
 use crate::ln::msgs;
 use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, ErrorAction, MessageSendEvent};
 use crate::ln::onion_utils::LocalHTLCFailureReason;
@@ -35,6 +36,7 @@ use bitcoin::locktime::absolute::LockTime;
 use bitcoin::network::Network;
 use bitcoin::opcodes;
 use bitcoin::script::Builder;
+use bitcoin::secp256k1;
 use bitcoin::transaction::Version;
 use bitcoin::{Transaction, TxOut, WitnessProgram, WitnessVersion};
 
@@ -1962,4 +1964,63 @@ fn test_pending_htlcs_arent_lost_on_mon_delay() {
 	nodes[0].node.handle_update_fail_htlc(node_b_id, &failures.update_fail_htlcs[0]);
 	do_commitment_signed_dance(&nodes[0], &nodes[1], &failures.commitment_signed, false, false);
 	expect_payment_failed!(nodes[0], payment_hash_b, false);
+}
+
+fn do_test_zero_balance_funder_coop_close_force_closes(test_counterparty_value: bool) {
+	let mut config = test_default_channel_config();
+	config.channel_handshake_config.negotiate_anchors_zero_fee_htlc_tx = false;
+	config.channel_handshake_config.negotiate_anchor_zero_fee_commitments = true;
+	config.channel_handshake_config.announced_channel_max_inbound_htlc_value_in_flight_percentage =
+		100;
+
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[Some(config.clone()), Some(config)]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+	let node_a_id = nodes[0].node.get_our_node_id();
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let channel_value_sat = 100_000;
+	let dust_limit_satoshis = 546;
+	let (channel_id, _) =
+		setup_0reserve_no_outputs_channels(&nodes, channel_value_sat, dust_limit_satoshis);
+	send_payment(&nodes[0], &[&nodes[1]], channel_value_sat * 1000);
+
+	nodes[0].node.close_channel(&channel_id, &node_b_id).unwrap();
+	let node_a_shutdown = get_event_msg!(nodes[0], MessageSendEvent::SendShutdown, node_b_id);
+	nodes[1].node.handle_shutdown(node_a_id, &node_a_shutdown);
+	let node_b_shutdown = get_event_msg!(nodes[1], MessageSendEvent::SendShutdown, node_a_id);
+
+	let (closing_node_idx, peer_node_id, expected_error) = if test_counterparty_value {
+		// Send the fundee a positive-fee proposal so it validates the fee against the funder's
+		// zero balance. The signature is never checked because the funder cannot pay any fee.
+		let closing_signed = msgs::ClosingSigned {
+			channel_id,
+			fee_satoshis: 1,
+			signature: secp256k1::ecdsa::Signature::from_compact(&[1; 64]).unwrap(),
+			fee_range: None,
+		};
+		nodes[1].node.handle_closing_signed(node_a_id, &closing_signed);
+		(1, node_a_id, "Value to counterparty below 0: -")
+	} else {
+		nodes[0].node.handle_shutdown(node_b_id, &node_b_shutdown);
+		(0, node_b_id, "Value to holder below 0: -")
+	};
+
+	let err_msg = check_closed_broadcast(&nodes[closing_node_idx], 1, true).pop().unwrap();
+	assert!(nodes[closing_node_idx].node.list_channels().is_empty());
+	check_added_monitors(&nodes[closing_node_idx], 1);
+	assert!(err_msg.data.starts_with(expected_error));
+	let reason = ClosureReason::ProcessingError { err: err_msg.data };
+	check_closed_event(&nodes[closing_node_idx], 1, reason, &[peer_node_id], channel_value_sat);
+}
+
+#[test]
+fn test_zero_balance_funder_coop_close_force_closes() {
+	do_test_zero_balance_funder_coop_close_force_closes(false);
+}
+
+#[test]
+fn test_zero_balance_funder_coop_close_force_closes_on_counterparty() {
+	do_test_zero_balance_funder_coop_close_force_closes(true);
 }
