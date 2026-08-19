@@ -11,6 +11,8 @@ use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::{Confirm, WatchedOutput};
 
 use std::collections::HashMap;
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
+use std::collections::HashSet;
 use std::ops::Deref;
 
 // Represents the current state.
@@ -92,6 +94,23 @@ impl SyncState {
 					self.outputs_spends_pending_threshold_conf.push(spent);
 				}
 			}
+		}
+	}
+
+	// Updates `SyncState` as `sync_confirmed_transactions` would for items whose confirmation
+	// the confirmables already know about, without re-feeding them via `Confirm`.
+	#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
+	pub fn apply_known_confirmations(
+		&mut self, known_confirmed_txids: &HashSet<Txid>,
+		known_output_spends: Vec<(Txid, u32, OutPoint, WatchedOutput)>,
+	) {
+		for txid in known_confirmed_txids {
+			self.watched_transactions.remove(txid);
+		}
+
+		for spent in known_output_spends {
+			self.watched_outputs.remove(&spent.2);
+			self.outputs_spends_pending_threshold_conf.push(spent);
 		}
 	}
 
