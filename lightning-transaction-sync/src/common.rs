@@ -93,6 +93,23 @@ impl SyncState {
 		}
 	}
 
+	// Updates `SyncState` as `sync_confirmed_transactions` would for items whose confirmation
+	// the confirmables already know about, without re-feeding them via `Confirm`.
+	#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
+	pub fn apply_known_confirmations(
+		&mut self, known_confirmed_txids: &HashSet<Txid>,
+		known_output_spends: Vec<(Txid, u32, OutPoint, WatchedOutput)>,
+	) {
+		for txid in known_confirmed_txids {
+			self.watched_transactions.remove(txid);
+		}
+
+		for spent in known_output_spends {
+			self.watched_outputs.remove(&spent.2);
+			self.outputs_spends_pending_threshold_conf.push(spent);
+		}
+	}
+
 	pub fn prune_output_spends(&mut self, cur_height: u32) {
 		self.outputs_spends_pending_threshold_conf
 			.retain(|(_, conf_height, _, _)| cur_height < conf_height + ANTI_REORG_DELAY - 1);

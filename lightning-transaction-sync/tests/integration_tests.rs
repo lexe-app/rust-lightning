@@ -222,7 +222,7 @@ macro_rules! test_syncing {
 			script_pubkey: prev_script_pubkey,
 		};
 
-		$tx_sync.register_output(output);
+		$tx_sync.register_output(output.clone());
 		maybe_await!($tx_sync.sync(vec![&$confirmable])).unwrap();
 
 		let events = std::mem::take(&mut *$confirmable.events.lock().unwrap());
@@ -302,6 +302,9 @@ macro_rules! test_syncing {
 		}
 
 		assert_eq!(seen_txids.len(), 0);
+
+		// Return the confirmed tx and output so the restart test below can re-register them.
+		(txid, new_address.script_pubkey(), output)
 	}};
 }
 
@@ -312,10 +315,26 @@ fn test_esplora_syncs() {
 	generate_blocks_and_wait(&bitcoind, &electrsd, 101);
 	let mut logger = TestLogger::new();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
-	let tx_sync = EsploraSyncClient::new(esplora_url, &mut logger);
+	let tx_sync = EsploraSyncClient::new(esplora_url.clone(), &mut logger);
 	let confirmable = TestConfirmable::new();
 
-	test_syncing!(tx_sync, confirmable, bitcoind, electrsd);
+	let (txid, script_pubkey, watched_output) =
+		test_syncing!(tx_sync, confirmable, bitcoind, electrsd);
+
+	// Simulate a restart with a fresh sync client. The confirmables retain their state, so
+	// re-registering the already-confirmed transaction and output must not re-feed them via
+	// `Confirm::transactions_confirmed`.
+	drop(tx_sync);
+	let tx_sync = EsploraSyncClient::new(esplora_url, &mut logger);
+	tx_sync.register_tx(&txid, &script_pubkey);
+	tx_sync.register_output(watched_output);
+	tx_sync.sync(vec![&confirmable]).unwrap();
+
+	let events = std::mem::take(&mut *confirmable.events.lock().unwrap());
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], TestConfirmableEvent::BestBlockUpdated));
+	assert_eq!(confirmable.confirmed_txs.lock().unwrap().len(), 2);
+	assert!(confirmable.unconfirmed_txs.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -325,10 +344,26 @@ async fn test_esplora_syncs() {
 	generate_blocks_and_wait(&bitcoind, &electrsd, 101);
 	let mut logger = TestLogger::new();
 	let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
-	let tx_sync = EsploraSyncClient::new(esplora_url, &mut logger);
+	let tx_sync = EsploraSyncClient::new(esplora_url.clone(), &mut logger);
 	let confirmable = TestConfirmable::new();
 
-	test_syncing!(tx_sync, confirmable, bitcoind, electrsd);
+	let (txid, script_pubkey, watched_output) =
+		test_syncing!(tx_sync, confirmable, bitcoind, electrsd);
+
+	// Simulate a restart with a fresh sync client. The confirmables retain their state, so
+	// re-registering the already-confirmed transaction and output must not re-feed them via
+	// `Confirm::transactions_confirmed`.
+	drop(tx_sync);
+	let tx_sync = EsploraSyncClient::new(esplora_url, &mut logger);
+	tx_sync.register_tx(&txid, &script_pubkey);
+	tx_sync.register_output(watched_output);
+	tx_sync.sync(vec![&confirmable]).await.unwrap();
+
+	let events = std::mem::take(&mut *confirmable.events.lock().unwrap());
+	assert_eq!(events.len(), 1);
+	assert!(matches!(events[0], TestConfirmableEvent::BestBlockUpdated));
+	assert_eq!(confirmable.confirmed_txs.lock().unwrap().len(), 2);
+	assert!(confirmable.unconfirmed_txs.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -340,5 +375,5 @@ fn test_electrum_syncs() {
 	let electrum_url = format!("tcp://{}", electrsd.electrum_url);
 	let tx_sync = ElectrumSyncClient::new(electrum_url, &mut logger).unwrap();
 	let confirmable = TestConfirmable::new();
-	test_syncing!(tx_sync, confirmable, bitcoind, electrsd);
+	let _ = test_syncing!(tx_sync, confirmable, bitcoind, electrsd);
 }

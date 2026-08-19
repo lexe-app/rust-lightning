@@ -15,7 +15,7 @@ use lightning::{log_debug, log_error, log_trace};
 
 use lightning_macros::{maybe_async, maybe_await};
 
-use bitcoin::{BlockHash, Script, Txid};
+use bitcoin::{BlockHash, OutPoint, Script, Txid};
 
 #[cfg(not(feature = "async-interface"))]
 use esplora_client::blocking::BlockingClient;
@@ -126,6 +126,12 @@ impl<L: Logger> EsploraSyncClient<L> {
 
 		let mut tip_hash = maybe_await!(self.client.get_tip_hash())?;
 
+		// Txids the confirmables already consider confirmed at a block still in the best
+		// chain. We track these so we don't have to re-fetch and re-feed them via
+		// `Confirm::transactions_confirmed`, which would redundantly re-persist any
+		// monitors with pending claims.
+		let mut known_confirmed_txids = HashSet::new();
+
 		for i in 0..100 {
 			if i >= 10 {
 				log_debug!(self.logger, "Giving up trying to sync transactions after 10 attempts.");
@@ -146,7 +152,7 @@ impl<L: Logger> EsploraSyncClient<L> {
 				if tip_is_new {
 					// First check for any unconfirmed transactions and act on it immediately.
 					match maybe_await!(self.get_unconfirmed_transactions(&confirmables)) {
-						Ok(unconfirmed_txs) => {
+						Ok((unconfirmed_txs, known_confirmed)) => {
 							// Double-check the tip hash. If it changed, a reorg happened since
 							// we started syncing and we need to restart last-minute.
 							match maybe_await!(self.client.get_tip_hash()) {
@@ -159,6 +165,14 @@ impl<L: Logger> EsploraSyncClient<L> {
 										continue;
 									}
 									num_unconfirmed += unconfirmed_txs.len();
+									known_confirmed_txids = known_confirmed;
+									if !known_confirmed_txids.is_empty() {
+										log_debug!(
+											self.logger,
+											"Skipping re-sync of {} known-confirmed transactions.",
+											known_confirmed_txids.len()
+										);
+									}
 									sync_state.sync_unconfirmed_transactions(
 										&confirmables,
 										unconfirmed_txs,
@@ -216,8 +230,10 @@ impl<L: Logger> EsploraSyncClient<L> {
 					}
 				}
 
-				match maybe_await!(self.get_confirmed_transactions(&sync_state)) {
-					Ok(confirmed_txs) => {
+				match maybe_await!(
+					self.get_confirmed_transactions(&sync_state, &known_confirmed_txids)
+				) {
+					Ok((confirmed_txs, known_output_spends)) => {
 						// Double-check the tip hash. If it changed, a reorg happened since
 						// we started syncing and we need to restart last-minute.
 						match maybe_await!(self.client.get_tip_hash()) {
@@ -233,6 +249,10 @@ impl<L: Logger> EsploraSyncClient<L> {
 								num_confirmed += confirmed_txs.len();
 								sync_state
 									.sync_confirmed_transactions(&confirmables, confirmed_txs);
+								sync_state.apply_known_confirmations(
+									&known_confirmed_txids,
+									known_output_spends,
+								);
 							},
 							Err(err) => {
 								// (Semi-)permanent failure, retry later.
@@ -317,20 +337,29 @@ impl<L: Logger> EsploraSyncClient<L> {
 
 	#[maybe_async]
 	fn get_confirmed_transactions(
-		&self, sync_state: &SyncState,
-	) -> Result<Vec<ConfirmedTx>, InternalError> {
+		&self, sync_state: &SyncState, known_confirmed_txids: &HashSet<Txid>,
+	) -> Result<(Vec<ConfirmedTx>, Vec<(Txid, u32, OutPoint, WatchedOutput)>), InternalError> {
 		// First, check the confirmation status of registered transactions as well as the
 		// status of dependent transactions of registered outputs.
 
-		let watched_txids = sync_state.watched_transactions.iter().copied().collect::<Vec<Txid>>();
+		let mut known_output_spends = Vec::new();
+
+		// Check the confirmation status of registered transactions that aren't already
+		// known to be confirmed.
+		let candidates = sync_state
+			.watched_transactions
+			.iter()
+			.filter(|txid| !known_confirmed_txids.contains(*txid))
+			.copied()
+			.collect::<Vec<Txid>>();
 		#[cfg(not(feature = "async-interface"))]
-		let mut confirmed_txs = watched_txids
+		let mut confirmed_txs = candidates
 			.into_iter()
 			.filter_map(|txid| self.get_confirmed_tx(txid, None, None).transpose())
 			.collect::<Result<Vec<ConfirmedTx>, _>>()?;
 		#[cfg(feature = "async-interface")]
 		let mut confirmed_txs = futures::stream::iter(
-			watched_txids.into_iter().map(|txid| self.get_confirmed_tx(txid, None, None)),
+			candidates.into_iter().map(|txid| self.get_confirmed_tx(txid, None, None)),
 		)
 		.buffer_unordered(self.max_concurrency)
 		.try_filter_map(|confirmed_tx_opt| futures::future::ok(confirmed_tx_opt))
@@ -339,30 +368,36 @@ impl<L: Logger> EsploraSyncClient<L> {
 
 		// Check the status of registered outputs, and whether their spending transactions
 		// are confirmed.
-		let watched_outputs =
-			sync_state.watched_outputs.values().cloned().collect::<Vec<WatchedOutput>>();
+		let watched_outputs = sync_state
+			.watched_outputs
+			.iter()
+			.map(|(outpoint, output)| (*outpoint, output.clone()))
+			.collect::<Vec<(OutPoint, WatchedOutput)>>();
 		#[cfg(not(feature = "async-interface"))]
 		let output_statuses = watched_outputs
 			.into_iter()
-			.map(|output| {
+			.map(|(outpoint, output)| {
 				let status = self
 					.client
 					.get_output_status(&output.outpoint.txid, output.outpoint.index as u64)?;
-				Ok(status)
+				Ok((outpoint, output, status))
 			})
 			.collect::<Result<Vec<_>, InternalError>>()?;
 		#[cfg(feature = "async-interface")]
-		let output_statuses =
-			futures::stream::iter(watched_outputs.into_iter().map(|output| async move {
-				self.client
+		let output_statuses = futures::stream::iter(watched_outputs.into_iter().map(
+			|(outpoint, output)| async move {
+				let status = self
+					.client
 					.get_output_status(&output.outpoint.txid, output.outpoint.index as u64)
-					.await
-			}))
-			.buffer_unordered(self.max_concurrency)
-			.try_collect::<Vec<_>>()
-			.await?;
+					.await?;
+				Ok::<_, esplora_client::Error>((outpoint, output, status))
+			},
+		))
+		.buffer_unordered(self.max_concurrency)
+		.try_collect::<Vec<_>>()
+		.await?;
 
-		for output_status_opt in output_statuses {
+		for (outpoint, output, output_status_opt) in output_statuses {
 			if let Some(output_status) = output_status_opt {
 				if let Some(spending_txid) = output_status.txid {
 					if let Some(spending_tx_status) = output_status.status {
@@ -373,6 +408,26 @@ impl<L: Logger> EsploraSyncClient<L> {
 							} else {
 								log_trace!(self.logger, "Inconsistency: Detected previously-confirmed Tx {} as unconfirmed", spending_txid);
 								return Err(InternalError::Inconsistency);
+							}
+						}
+
+						if known_confirmed_txids.contains(&spending_txid) {
+							// The confirmables already know about this spend; record it so the
+							// watched output still gets pruned, but without re-fetching the transaction.
+							match (spending_tx_status.confirmed, spending_tx_status.block_height) {
+								(true, Some(block_height)) => {
+									let spent = (spending_txid, block_height, outpoint, output);
+									known_output_spends.push(spent);
+									continue;
+								},
+								_ => {
+									log_trace!(
+										self.logger,
+										"Inconsistency: Detected previously-confirmed Tx {} as unconfirmed",
+										spending_txid
+									);
+									return Err(InternalError::Inconsistency);
+								},
 							}
 						}
 
@@ -394,7 +449,7 @@ impl<L: Logger> EsploraSyncClient<L> {
 			tx1.block_height.cmp(&tx2.block_height).then_with(|| tx1.pos.cmp(&tx2.pos))
 		});
 
-		Ok(confirmed_txs)
+		Ok((confirmed_txs, known_output_spends))
 	}
 
 	#[maybe_async]
@@ -480,12 +535,13 @@ impl<L: Logger> EsploraSyncClient<L> {
 	#[maybe_async]
 	fn get_unconfirmed_transactions<C: Deref>(
 		&self, confirmables: &Vec<C>,
-	) -> Result<Vec<Txid>, InternalError>
+	) -> Result<(Vec<Txid>, HashSet<Txid>), InternalError>
 	where
 		C::Target: Confirm,
 	{
 		// Query the interface for relevant txids and check whether the relevant blocks are still
-		// in the best chain, mark them unconfirmed otherwise
+		// in the best chain, mark them unconfirmed otherwise. Txids whose block is still in the
+		// best chain are already fully known to the confirmables and don't need to be re-synced.
 		let relevant_txids = confirmables
 			.iter()
 			.flat_map(|c| c.get_relevant_txids())
@@ -516,6 +572,7 @@ impl<L: Logger> EsploraSyncClient<L> {
 			.await?;
 
 		let mut unconfirmed_txs = Vec::new();
+		let mut known_confirmed_txids = HashSet::new();
 
 		for (txid, _conf_height, block_hash_opt) in relevant_txids {
 			if let Some(block_hash) = block_hash_opt {
@@ -524,6 +581,7 @@ impl<L: Logger> EsploraSyncClient<L> {
 					.expect("all reported block hashes were fetched above");
 				if block_status.in_best_chain {
 					// Skip if the block in question is still confirmed.
+					known_confirmed_txids.insert(txid);
 					continue;
 				}
 
@@ -533,7 +591,12 @@ impl<L: Logger> EsploraSyncClient<L> {
 				panic!("Untracked confirmation of funding transaction. Please ensure none of your channels had been created with LDK prior to version 0.0.113!");
 			}
 		}
-		Ok(unconfirmed_txs)
+
+		// A txid reported both at a best-chain block and a reorged-out one still needs a
+		// re-sync to correct the stale view.
+		known_confirmed_txids.retain(|txid| !unconfirmed_txs.contains(txid));
+
+		Ok((unconfirmed_txs, known_confirmed_txids))
 	}
 
 	/// Returns a reference to the underlying esplora client.
