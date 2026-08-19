@@ -23,8 +23,15 @@ use esplora_client::blocking::BlockingClient;
 use esplora_client::r#async::AsyncClient;
 use esplora_client::Builder;
 
+#[cfg(feature = "async-interface")]
+use futures::stream::{StreamExt, TryStreamExt};
+
 use core::ops::Deref;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+// The default maximum number of concurrent Esplora requests while syncing.
+#[cfg(feature = "async-interface")]
+const DEFAULT_MAX_CONCURRENCY: usize = 16;
 
 /// Synchronizes LDK with a given [`Esplora`] server.
 ///
@@ -47,6 +54,8 @@ pub struct EsploraSyncClient<L: Logger> {
 	queue: std::sync::Mutex<FilterQueue>,
 	client: EsploraClientType,
 	logger: L,
+	#[cfg(feature = "async-interface")]
+	max_concurrency: usize,
 }
 
 impl<L: Logger> EsploraSyncClient<L> {
@@ -67,7 +76,24 @@ impl<L: Logger> EsploraSyncClient<L> {
 	pub fn from_client(client: EsploraClientType, logger: L) -> Self {
 		let sync_state = MutexType::new(SyncState::new());
 		let queue = std::sync::Mutex::new(FilterQueue::new());
-		Self { sync_state, queue, client, logger }
+		Self {
+			sync_state,
+			queue,
+			client,
+			logger,
+			#[cfg(feature = "async-interface")]
+			max_concurrency: DEFAULT_MAX_CONCURRENCY,
+		}
+	}
+
+	/// Sets the maximum number of concurrent Esplora requests while syncing.
+	///
+	/// Defaults to 16. Panics if set to zero.
+	#[cfg(feature = "async-interface")]
+	pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+		assert!(concurrency != 0);
+		self.max_concurrency = concurrency;
+		self
 	}
 
 	/// Synchronizes the given `confirmables` via their [`Confirm`] interface implementations. This
@@ -296,22 +322,48 @@ impl<L: Logger> EsploraSyncClient<L> {
 		// First, check the confirmation status of registered transactions as well as the
 		// status of dependent transactions of registered outputs.
 
-		let mut confirmed_txs: Vec<ConfirmedTx> = Vec::new();
+		let watched_txids = sync_state.watched_transactions.iter().copied().collect::<Vec<Txid>>();
+		#[cfg(not(feature = "async-interface"))]
+		let mut confirmed_txs = watched_txids
+			.into_iter()
+			.filter_map(|txid| self.get_confirmed_tx(txid, None, None).transpose())
+			.collect::<Result<Vec<ConfirmedTx>, _>>()?;
+		#[cfg(feature = "async-interface")]
+		let mut confirmed_txs = futures::stream::iter(
+			watched_txids.into_iter().map(|txid| self.get_confirmed_tx(txid, None, None)),
+		)
+		.buffer_unordered(self.max_concurrency)
+		.try_filter_map(|confirmed_tx_opt| futures::future::ok(confirmed_tx_opt))
+		.try_collect::<Vec<ConfirmedTx>>()
+		.await?;
 
-		for txid in &sync_state.watched_transactions {
-			if confirmed_txs.iter().any(|ctx| ctx.txid == *txid) {
-				continue;
-			}
-			if let Some(confirmed_tx) = maybe_await!(self.get_confirmed_tx(*txid, None, None))? {
-				confirmed_txs.push(confirmed_tx);
-			}
-		}
+		// Check the status of registered outputs, and whether their spending transactions
+		// are confirmed.
+		let watched_outputs =
+			sync_state.watched_outputs.values().cloned().collect::<Vec<WatchedOutput>>();
+		#[cfg(not(feature = "async-interface"))]
+		let output_statuses = watched_outputs
+			.into_iter()
+			.map(|output| {
+				let status = self
+					.client
+					.get_output_status(&output.outpoint.txid, output.outpoint.index as u64)?;
+				Ok(status)
+			})
+			.collect::<Result<Vec<_>, InternalError>>()?;
+		#[cfg(feature = "async-interface")]
+		let output_statuses =
+			futures::stream::iter(watched_outputs.into_iter().map(|output| async move {
+				self.client
+					.get_output_status(&output.outpoint.txid, output.outpoint.index as u64)
+					.await
+			}))
+			.buffer_unordered(self.max_concurrency)
+			.try_collect::<Vec<_>>()
+			.await?;
 
-		for (_, output) in &sync_state.watched_outputs {
-			if let Some(output_status) = maybe_await!(self
-				.client
-				.get_output_status(&output.outpoint.txid, output.outpoint.index as u64))?
-			{
+		for output_status_opt in output_statuses {
+			if let Some(output_status) = output_status_opt {
 				if let Some(spending_txid) = output_status.txid {
 					if let Some(spending_tx_status) = output_status.status {
 						if confirmed_txs.iter().any(|ctx| ctx.txid == spending_txid) {
@@ -439,11 +491,37 @@ impl<L: Logger> EsploraSyncClient<L> {
 			.flat_map(|c| c.get_relevant_txids())
 			.collect::<HashSet<(Txid, u32, Option<BlockHash>)>>();
 
+		// Fetch the status of all distinct blocks the confirmables consider transactions
+		// confirmed in.
+		let block_hashes = relevant_txids
+			.iter()
+			.filter_map(|(_, _, block_hash_opt)| *block_hash_opt)
+			.collect::<HashSet<BlockHash>>();
+		#[cfg(not(feature = "async-interface"))]
+		let block_statuses = block_hashes
+			.into_iter()
+			.map(|block_hash| {
+				let block_status = self.client.get_block_status(&block_hash)?;
+				Ok((block_hash, block_status))
+			})
+			.collect::<Result<HashMap<_, _>, InternalError>>()?;
+		#[cfg(feature = "async-interface")]
+		let block_statuses =
+			futures::stream::iter(block_hashes.into_iter().map(|block_hash| async move {
+				let block_status = self.client.get_block_status(&block_hash).await?;
+				Ok::<_, esplora_client::Error>((block_hash, block_status))
+			}))
+			.buffer_unordered(self.max_concurrency)
+			.try_collect::<HashMap<_, _>>()
+			.await?;
+
 		let mut unconfirmed_txs = Vec::new();
 
 		for (txid, _conf_height, block_hash_opt) in relevant_txids {
 			if let Some(block_hash) = block_hash_opt {
-				let block_status = maybe_await!(self.client.get_block_status(&block_hash))?;
+				let block_status = block_statuses
+					.get(&block_hash)
+					.expect("all reported block hashes were fetched above");
 				if block_status.in_best_chain {
 					// Skip if the block in question is still confirmed.
 					continue;
