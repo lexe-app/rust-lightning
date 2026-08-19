@@ -10,6 +10,8 @@ use bitcoin::{BlockHash, OutPoint, ScriptBuf, Transaction, Txid};
 use lightning::chain::channelmonitor::ANTI_REORG_DELAY;
 use lightning::chain::Confirm;
 
+#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
+use std::collections::HashSet;
 use std::collections::{BTreeSet, HashMap};
 use std::ops::Deref;
 
@@ -95,6 +97,25 @@ impl SyncState {
 					let spent = (ctx.txid, ctx.block_height, input.previous_output, output);
 					self.outputs_spends_pending_threshold_conf.push(spent);
 				}
+			}
+		}
+	}
+
+	// Updates `SyncState` as `sync_confirmed_transactions` would for items whose confirmation
+	// the confirmables already know about, without re-feeding them via `Confirm`.
+	#[cfg(any(feature = "esplora-blocking", feature = "esplora-async"))]
+	pub fn apply_known_confirmations(
+		&mut self, known_confirmed_txids: &HashSet<Txid>,
+		known_output_spends: Vec<(Txid, u32, OutPoint)>,
+	) {
+		for txid in known_confirmed_txids {
+			self.watched_transactions.remove(txid);
+		}
+
+		for (spending_txid, conf_height, outpoint) in known_output_spends {
+			if let Some(script_pubkeys) = self.watched_outputs.remove(&outpoint) {
+				let spent = (spending_txid, conf_height, outpoint, script_pubkeys);
+				self.outputs_spends_pending_threshold_conf.push(spent);
 			}
 		}
 	}
