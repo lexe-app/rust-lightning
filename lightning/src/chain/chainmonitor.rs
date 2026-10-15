@@ -975,6 +975,60 @@ where
 		}
 	}
 
+	/// Archives the [`ChannelMonitor`] for a closed channel by calling
+	/// [`Persist::archive_persisted_channel`], even if it is not fully resolved.
+	///
+	/// This is useful for pruning monitors which will never resolve, e.g. if the channel's funding
+	/// transaction was double-spent, which otherwise rebroadcast their claims forever. Any funds
+	/// the monitor could still claim on-chain are abandoned.
+	///
+	/// The [`ChannelManager`] must have already closed the channel and must never generate another
+	/// [`ChannelMonitorUpdate`] for it, e.g. to claim an HTLC, otherwise it will fail to
+	/// deserialize on restart.
+	///
+	/// Must not be called from this monitor's synchronous
+	/// [`EventsProvider::process_pending_events`] handler, which holds a monitor read lock and
+	/// would deadlock with this method's write lock. Defer archiving until after event processing.
+	///
+	/// Returns an [`APIError::APIMisuseError`] if there's no monitor for this channel, the monitor
+	/// has pending (or, in deferred mode, queued) updates, or the channel isn't closed.
+	///
+	/// [`ChannelManager`]: crate::ln::channelmanager::ChannelManager
+	/// [`EventsProvider::process_pending_events`]: crate::events::EventsProvider::process_pending_events
+	pub fn force_archive_channel_monitor(&self, channel_id: ChannelId) -> Result<(), APIError> {
+		// Same lock order as `flush`, which applies a queued op after popping it from
+		// `pending_ops`, so holding `flush_lock` ensures no op for this channel is in-flight.
+		let _flush_guard = self.flush_lock.lock().unwrap();
+		let pending_ops = self.pending_ops.lock().unwrap();
+		let mut monitors = self.monitors.write().unwrap();
+		let monitor_holder = monitors.get(&channel_id).ok_or_else(|| APIError::APIMisuseError {
+			err: format!("No ChannelMonitor matching channel ID {} found", channel_id),
+		})?;
+		let has_queued_ops = pending_ops.iter().any(|op| match op {
+			PendingMonitorOp::NewMonitor { channel_id: id, .. }
+			| PendingMonitorOp::Update { channel_id: id, .. } => *id == channel_id,
+		});
+		if has_queued_ops
+			|| monitor_holder
+				.has_pending_updates(&monitor_holder.pending_monitor_updates.lock().unwrap())
+		{
+			return Err(APIError::APIMisuseError {
+				err: format!("ChannelMonitor for channel {} has pending updates", channel_id),
+			});
+		}
+		if !monitor_holder.monitor.no_further_updates_allowed() {
+			return Err(APIError::APIMisuseError {
+				err: format!("Channel {} is not closed", channel_id),
+			});
+		}
+
+		let monitor_holder = monitors.remove(&channel_id).expect("Checked above");
+		let logger = WithChannelMonitor::from(&self.logger, &monitor_holder.monitor, None);
+		log_info!(logger, "Force-archiving ChannelMonitor which is not fully resolved");
+		self.persister.archive_persisted_channel(monitor_holder.monitor.persistence_key());
+		Ok(())
+	}
+
 	/// This function collects the counterparty node IDs from all monitors into a `HashSet`,
 	/// ensuring unique IDs are returned.
 	#[cfg(peer_storage)]

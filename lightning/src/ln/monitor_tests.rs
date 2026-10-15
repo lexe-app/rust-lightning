@@ -12,7 +12,7 @@
 //! Further functional tests which test blockchain reorganizations.
 
 use crate::sign::{ecdsa::EcdsaChannelSigner, OutputSpender, SignerProvider, SpendableOutputDescriptor};
-use crate::chain::{BlockLocator, Watch};
+use crate::chain::{BlockLocator, ChannelMonitorUpdateStatus, Watch};
 use crate::chain::channelmonitor::{Balance, BalanceSource, ChannelMonitor, ChannelMonitorUpdateStep, HolderCommitmentTransactionBalance, ANTI_REORG_DELAY, ARCHIVAL_DELAY_BLOCKS, COUNTERPARTY_CLAIMABLE_WITHIN_BLOCKS_PINNABLE, LATENCY_GRACE_PERIOD_BLOCKS};
 use crate::chain::transaction::OutPoint;
 use crate::chain::chaininterface::{ConfirmationTarget, LowerBoundedFeeEstimator, compute_feerate_sat_per_1000_weight};
@@ -25,6 +25,7 @@ use crate::ln::channelmanager::{BREAKDOWN_TIMEOUT, ChannelManagerReadArgs, Payme
 use crate::ln::outbound_payment::RecipientOnionFields;
 use crate::ln::msgs::{BaseMessageHandler, ChannelMessageHandler, MessageSendEvent};
 use crate::crypto::utils::sign;
+use crate::util::errors::APIError;
 use crate::util::ser::{ReadableArgs, Writeable};
 use crate::util::test_channel_signer::TestChannelSigner;
 use crate::util::scid_utils::block_from_scid;
@@ -39,6 +40,7 @@ use bitcoin::sighash::{SighashCache, EcdsaSighashType};
 use bitcoin::transaction::Version;
 
 use crate::prelude::*;
+use core::sync::atomic::Ordering;
 
 use crate::ln::functional_test_utils::*;
 
@@ -311,6 +313,71 @@ fn archive_fully_resolved_monitors() {
 	}
 }
 
+
+#[test]
+fn force_archive_unresolved_monitor() {
+	// Test we can force-archive the monitor of a closed channel whose funding never confirms,
+	// which would otherwise never be fully resolved, but only once the `ChannelManager` can no
+	// longer be waiting on any of its updates.
+	let chanmon_cfgs = create_chanmon_cfgs(2);
+	let node_cfgs = create_node_cfgs_deferred(2, &chanmon_cfgs);
+	let node_chanmgrs = create_node_chanmgrs(2, &node_cfgs, &[None, None]);
+	let nodes = create_network(2, &node_cfgs, &node_chanmgrs);
+
+	let node_b_id = nodes[1].node.get_our_node_id();
+
+	let funding_tx = create_chan_between_nodes_with_value_init(&nodes[0], &nodes[1], 1_000_000, 100_000);
+	let chan_id = nodes[0].node.list_channels()[0].channel_id;
+	let chain_monitor = &nodes[0].chain_monitor.chain_monitor;
+	let assert_archive_err = |expected: &str| match chain_monitor.force_archive_channel_monitor(chan_id) {
+		Err(APIError::APIMisuseError { err }) => assert!(err.contains(expected), "{err}"),
+		res => panic!("Unexpected result: {res:?}"),
+	};
+
+	// Can't archive the monitor of an open channel.
+	assert_archive_err("is not closed");
+
+	// Force close while the closing monitor update is still queued.
+	nodes[0].chain_monitor.pause_flush.store(true, Ordering::Release);
+	let message = "Channel force-closed".to_owned();
+	nodes[0].node.force_close_broadcasting_latest_txn(&chan_id, &node_b_id, message.clone()).unwrap();
+	check_added_monitors(&nodes[0], 1);
+	// Unconfirmed channels have no channel update to broadcast, just the error message.
+	let msg_events = nodes[0].node.get_and_clear_pending_msg_events();
+	assert_eq!(msg_events.len(), 1);
+	assert!(matches!(msg_events[0], MessageSendEvent::HandleError { .. }));
+	let reason = ClosureReason::HolderForceClosed { broadcasted_latest_txn: Some(true), message };
+	check_closed_event(&nodes[0], 1, reason, &[node_b_id], 1_000_000);
+	assert_archive_err("has pending updates");
+
+	// Apply the closing update, but leave its persistence in progress.
+	chanmon_cfgs[0].persister.set_update_ret(ChannelMonitorUpdateStatus::InProgress);
+	nodes[0].chain_monitor.pause_flush.store(false, Ordering::Release);
+	chain_monitor.flush(chain_monitor.pending_operation_count(), &nodes[0].logger);
+	assert_archive_err("has pending updates");
+	nodes[0].chain_monitor.complete_sole_pending_chan_update(&chan_id);
+
+	// The monitor will never resolve, but we can still force-archive it.
+	chain_monitor.archive_fully_resolved_channel_monitors();
+	assert_eq!(chain_monitor.list_monitors(), vec![chan_id]);
+	assert!(!chain_monitor.get_claimable_balances(&[]).is_empty());
+
+	chain_monitor.force_archive_channel_monitor(chan_id).unwrap();
+	assert!(chain_monitor.list_monitors().is_empty());
+	assert!(chain_monitor.get_claimable_balances(&[]).is_empty());
+	assert_archive_err("No ChannelMonitor");
+
+	// The `ChannelManager` still learns that the closing update completed, so it reloads without
+	// the archived monitor in the `Drop` checks.
+	assert!(nodes[0].node.get_and_clear_pending_msg_events().is_empty());
+
+	// Remove the corresponding outputs and transactions the chain source is
+	// watching. This is to make sure the `Drop` function assertions pass.
+	nodes[0].chain_source.remove_watched_txn_and_outputs(
+		OutPoint { txid: funding_tx.compute_txid(), index: 0 },
+		funding_tx.output[0].script_pubkey.clone()
+	);
+}
 #[test]
 fn archive_monitor_with_pending_closure_event() {
 	// Test that we don't archive a `ChannelMonitor` which still has a closure `MonitorEvent` that
