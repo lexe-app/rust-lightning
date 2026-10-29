@@ -5091,6 +5091,10 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 		self.channel_id
 	}
 
+	pub fn channel_id_ref(&self) -> &ChannelId {
+		&self.channel_id
+	}
+
 	// Return the `temporary_channel_id` used during channel establishment.
 	//
 	// Will return `None` for channels created prior to LDK version 0.0.115.
@@ -5362,6 +5366,11 @@ impl<SP: SignerProvider> ChannelContext<SP> {
 	/// Allowed in any state (including after shutdown)
 	pub fn get_counterparty_node_id(&self) -> PublicKey {
 		self.counterparty_node_id
+	}
+
+	/// Allowed in any state (including after shutdown)
+	pub fn counterparty_node_id_ref(&self) -> &PublicKey {
+		&self.counterparty_node_id
 	}
 
 	/// Allowed in any state (including after shutdown)

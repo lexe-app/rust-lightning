@@ -676,6 +676,100 @@ impl_writeable_tlv_based!(ChannelDetails, {
 	)),
 });
 
+/// A cheap, read-only view of an open channel, as passed to the filter given to
+/// [`ChannelManager::list_channels_with_filter`].
+///
+/// [`ChannelManager::list_channels_with_filter`]: crate::ln::channelmanager::ChannelManager::list_channels_with_filter
+pub struct ChannelView<'a, SP: SignerProvider> {
+	channel: &'a Channel<SP>,
+	counterparty_features: &'a InitFeatures,
+}
+
+impl<'a, SP: SignerProvider> ChannelView<'a, SP> {
+	pub(super) fn new(channel: &'a Channel<SP>, counterparty_features: &'a InitFeatures) -> Self {
+		Self { channel, counterparty_features }
+	}
+
+	/// The channel's ID. See [`ChannelDetails::channel_id`].
+	pub fn channel_id(&self) -> &'a ChannelId {
+		self.channel.context().channel_id_ref()
+	}
+
+	/// The node_id of our counterparty. See [`ChannelCounterparty::node_id`].
+	pub fn counterparty_node_id(&self) -> &'a PublicKey {
+		self.channel.context().counterparty_node_id_ref()
+	}
+
+	/// The features our counterparty provided upon last connection. See
+	/// [`ChannelCounterparty::features`].
+	pub fn counterparty_features(&self) -> &'a InitFeatures {
+		self.counterparty_features
+	}
+
+	/// The `user_channel_id` this channel was created or accepted with. See
+	/// [`ChannelDetails::user_channel_id`].
+	pub fn user_channel_id(&self) -> u128 {
+		self.channel.context().get_user_id()
+	}
+
+	/// The position of the funding transaction in the chain, if confirmed. See
+	/// [`ChannelDetails::short_channel_id`].
+	pub fn short_channel_id(&self) -> Option<u64> {
+		self.channel.funding().get_short_channel_id()
+	}
+
+	/// Our [`Self::short_channel_id`] alias for this channel, if the channel is available for
+	/// routing outbound payments. See [`ChannelDetails::outbound_scid_alias`].
+	pub fn outbound_scid_alias(&self) -> Option<u64> {
+		let context = self.channel.context();
+		if context.is_usable() {
+			Some(context.outbound_scid_alias())
+		} else {
+			None
+		}
+	}
+
+	/// The value, in satoshis, of this channel as appears in the funding output. See
+	/// [`ChannelDetails::channel_value_satoshis`].
+	pub fn channel_value_satoshis(&self) -> u64 {
+		self.channel.funding().get_value_satoshis()
+	}
+
+	/// True if the channel was initiated (and thus funded) by us. See
+	/// [`ChannelDetails::is_outbound`].
+	pub fn is_outbound(&self) -> bool {
+		self.channel.funding().is_outbound()
+	}
+
+	/// True if the channel's funding transaction has been negotiated with our counterparty and
+	/// the initial commitment transactions have been signed, though the funding transaction may
+	/// not have confirmed yet.
+	///
+	/// Unlike the other getters, this has no matching [`ChannelDetails`] field. Channels for which
+	/// this is false are still being opened.
+	pub fn is_funded(&self) -> bool {
+		self.channel.is_funded()
+	}
+
+	/// True if the channel is confirmed, `channel_ready` messages have been exchanged, and the
+	/// channel is not currently being shut down. See [`ChannelDetails::is_channel_ready`].
+	pub fn is_channel_ready(&self) -> bool {
+		self.channel.context().is_usable()
+	}
+
+	/// True if the channel is ready, the peer is connected, and the channel is not currently
+	/// negotiating a shutdown. See [`ChannelDetails::is_usable`].
+	pub fn is_usable(&self) -> bool {
+		self.channel.context().is_live()
+	}
+
+	/// True if this channel is (or will be) publicly-announced. See
+	/// [`ChannelDetails::is_announced`].
+	pub fn is_announced(&self) -> bool {
+		self.channel.context().should_announce()
+	}
+}
+
 /// Details of pending splice attempts on a channel, as returned in
 /// [`ChannelDetails::splice_details`].
 ///
