@@ -107,6 +107,24 @@ pub trait ScoreLookUp {
 	fn channel_penalty_msat(
 		&self, candidate: &CandidateRouteHop, usage: ChannelUsage, score_params: &Self::ScoreParams
 	) -> u64;
+
+	/// Returns the exact liquidity, in millisats, available to route over `candidate`, if this
+	/// scorer knows the value precisely.
+	///
+	/// When `Some`, the router uses it in place of the candidate's [`EffectiveCapacity`] for the
+	/// whole route search, as [`EffectiveCapacity::ExactLiquidity`], which is also what
+	/// [`Self::channel_penalty_msat`] is given: the total amount sent over the hop by all MPP
+	/// parts never exceeds it, [`max_channel_saturation_power_of_half`] does not apply, and
+	/// `Some(0)` makes the hop unusable.
+	///
+	/// This is called for every candidate hop the router evaluates, so implementations must be
+	/// cheap. It may be called several times for the same hop, and must return the same value each
+	/// time throughout a route search.
+	///
+	/// [`max_channel_saturation_power_of_half`]: crate::routing::router::PaymentParameters::max_channel_saturation_power_of_half
+	fn channel_liquidity_msat(&self, _candidate: &CandidateRouteHop) -> Option<u64> {
+		None
+	}
 }
 
 /// `ScoreUpdate` is used to update the scorer's internal state after a payment attempt.
@@ -148,6 +166,10 @@ impl<S: ScoreLookUp, T: Deref<Target=S>> ScoreLookUp for T {
 		&self, candidate: &CandidateRouteHop, usage: ChannelUsage, score_params: &Self::ScoreParams
 	) -> u64 {
 		self.deref().channel_penalty_msat(candidate, usage, score_params)
+	}
+
+	fn channel_liquidity_msat(&self, candidate: &CandidateRouteHop) -> Option<u64> {
+		self.deref().channel_liquidity_msat(candidate)
 	}
 }
 
@@ -331,6 +353,10 @@ impl<'a, T: Score> ScoreLookUp for MultiThreadedScoreLockRead<'a, T> {
 		&self, candidate: &CandidateRouteHop, usage: ChannelUsage, score_params: &Self::ScoreParams,
 	) -> u64 {
 		self.0.channel_penalty_msat(candidate, usage, score_params)
+	}
+
+	fn channel_liquidity_msat(&self, candidate: &CandidateRouteHop) -> Option<u64> {
+		self.0.channel_liquidity_msat(candidate)
 	}
 }
 
@@ -1941,6 +1967,10 @@ impl<G: Deref<Target = NetworkGraph<L>>, L: Logger> ScoreLookUp for CombinedScor
 		score_params: &ProbabilisticScoringFeeParameters,
 	) -> u64 {
 		self.scorer.channel_penalty_msat(candidate, usage, score_params)
+	}
+
+	fn channel_liquidity_msat(&self, candidate: &CandidateRouteHop) -> Option<u64> {
+		self.scorer.channel_liquidity_msat(candidate)
 	}
 }
 
