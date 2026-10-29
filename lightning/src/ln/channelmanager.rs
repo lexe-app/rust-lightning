@@ -65,7 +65,7 @@ use crate::ln::channel::{
 	SpliceFundingPromotion, SpliceRbfAbort, StfuResponse, UpdateFulfillCommitFetch,
 	WithChannelContext,
 };
-use crate::ln::channel_state::ChannelDetails;
+use crate::ln::channel_state::{ChannelDetails, ChannelView};
 use crate::ln::funding::{FundingContribution, FundingTemplate};
 use crate::ln::inbound_payment;
 use crate::ln::interactivetxs::InteractiveTxMessageSend;
@@ -4162,6 +4162,36 @@ impl<
 						&self.fee_estimator,
 					);
 					res.push(details);
+				}
+			}
+		}
+		res
+	}
+
+	/// Gets the list of open channels for which `filter` returns true, in random order. Unlike
+	/// filtering [`Self::list_channels`], [`ChannelDetails`] are only built for matching channels.
+	///
+	/// This is not exported to bindings users as it takes a closure.
+	pub fn list_channels_with_filter<Filter: FnMut(ChannelView<'_, SP>) -> bool>(
+		&self, mut filter: Filter,
+	) -> Vec<ChannelDetails> {
+		let mut res = Vec::with_capacity(32);
+		{
+			let best_block_height = self.best_block.read().unwrap().height;
+			let per_peer_state = self.per_peer_state.read().unwrap();
+			for (_cp_id, peer_state_mutex) in per_peer_state.iter() {
+				let peer_state = peer_state_mutex.lock().unwrap();
+				let features = &peer_state.latest_features;
+				for (_, channel) in peer_state.channel_by_id.iter() {
+					if filter(ChannelView::new(channel, features)) {
+						let details = ChannelDetails::from_channel(
+							channel,
+							best_block_height,
+							features.clone(),
+							&self.fee_estimator,
+						);
+						res.push(details);
+					}
 				}
 			}
 		}
@@ -10069,7 +10099,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: &HTLCPreviousHopData, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -10107,7 +10138,8 @@ impl<
 		ComplFunc: FnOnce(
 			Option<u64>,
 			bool,
-		) -> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
+		)
+			-> (Option<MonitorUpdateCompletionAction>, Option<RAAMonitorUpdateBlockingAction>),
 	>(
 		&self, prev_hop: HTLCClaimSource, payment_preimage: PaymentPreimage,
 		payment_info: Option<PaymentClaimDetails>, attribution_data: Option<AttributionData>,
@@ -21411,6 +21443,87 @@ mod tests {
 		assert!(nodes[1].node.get_event_or_persistence_needed_future().poll_is_complete());
 		assert_ne!(nodes[0].node.list_channels()[0], node_a_chan_info);
 		assert_ne!(nodes[1].node.list_channels()[0], node_b_chan_info);
+	}
+
+	#[test]
+	fn test_list_channels_with_filter() {
+		// Check that `list_channels_with_filter` lists the same channels as `list_channels`,
+		// including ones which are not yet funded, but only those matching the filter.
+		let chanmon_cfgs = create_chanmon_cfgs(3);
+		let node_cfgs = create_node_cfgs(3, &chanmon_cfgs);
+		let node_chanmgrs = create_node_chanmgrs(3, &node_cfgs, &[None, None, None]);
+		let nodes = create_network(3, &node_cfgs, &node_chanmgrs);
+		let node_c_id = nodes[2].node.get_our_node_id();
+
+		let announced_chan_id = create_announced_chan_between_nodes(&nodes, 0, 1).2;
+		create_unannounced_chan_between_nodes_with_value(&nodes, 0, 2, 100_000, 0);
+		nodes[0].node.create_channel(node_c_id, 100_000, 0, 42, None, None).unwrap();
+		get_event_msg!(nodes[0], MessageSendEvent::SendOpenChannel, node_c_id);
+
+		let mut all_chans = nodes[0].node.list_channels();
+		all_chans.sort_unstable_by_key(|chan| chan.channel_id);
+		assert_eq!(all_chans.len(), 3);
+
+		// Every getter matches the corresponding `ChannelDetails` field.
+		let mut views = Vec::new();
+		let mut listed_chans = nodes[0].node.list_channels_with_filter(|chan| {
+			views.push((
+				*chan.channel_id(),
+				*chan.counterparty_node_id(),
+				chan.counterparty_features().clone(),
+				chan.user_channel_id(),
+				chan.short_channel_id(),
+				chan.outbound_scid_alias(),
+				chan.channel_value_satoshis(),
+				chan.is_outbound(),
+				chan.is_channel_ready(),
+				chan.is_usable(),
+				chan.is_announced(),
+			));
+			true
+		});
+		listed_chans.sort_unstable_by_key(|chan| chan.channel_id);
+		views.sort_unstable_by_key(|view| view.0);
+		assert_eq!(listed_chans, all_chans);
+		let details_views: Vec<_> = all_chans
+			.iter()
+			.map(|chan| {
+				(
+					chan.channel_id,
+					chan.counterparty.node_id,
+					chan.counterparty.features.clone(),
+					chan.user_channel_id,
+					chan.short_channel_id,
+					chan.outbound_scid_alias,
+					chan.channel_value_satoshis,
+					chan.is_outbound,
+					chan.is_channel_ready,
+					chan.is_usable,
+					chan.is_announced,
+				)
+			})
+			.collect();
+		assert_eq!(views, details_views);
+
+		// The unfunded channel will be announced, but is not yet funded.
+		let announced_chans = nodes[0].node.list_channels_with_filter(|chan| chan.is_announced());
+		assert_eq!(announced_chans.len(), 2);
+		let funded_announced_chans =
+			nodes[0].node.list_channels_with_filter(|chan| chan.is_funded() && chan.is_announced());
+		assert_eq!(funded_announced_chans.len(), 1);
+		assert_eq!(funded_announced_chans[0].channel_id, announced_chan_id);
+		assert!(funded_announced_chans[0].is_usable);
+
+		let unfunded_chans = nodes[0].node.list_channels_with_filter(|chan| !chan.is_funded());
+		assert_eq!(unfunded_chans.len(), 1);
+		assert_eq!(unfunded_chans[0].counterparty.node_id, node_c_id);
+		assert_eq!(unfunded_chans[0].short_channel_id, None);
+
+		let unannounced_chans =
+			nodes[0].node.list_channels_with_filter(|chan| !chan.is_announced());
+		assert_eq!(unannounced_chans.len(), 1);
+		assert_eq!(unannounced_chans[0].counterparty.node_id, node_c_id);
+		assert!(unannounced_chans[0].is_usable);
 	}
 
 	#[test]
