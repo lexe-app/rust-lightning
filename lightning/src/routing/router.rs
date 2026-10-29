@@ -404,6 +404,19 @@ where
 			self.scorer.channel_penalty_msat(candidate, usage, score_params)
 		}
 	}
+
+	fn channel_liquidity_msat(&self, candidate: &CandidateRouteHop) -> Option<u64> {
+		let liquidity_msat = self.scorer.channel_liquidity_msat(candidate)?;
+		let used_liquidity_msat = if let CandidateRouteHop::Blinded(hop) = candidate {
+			let blinding_point = hop.hint.blinding_point();
+			self.inflight_htlcs.used_blinded_liquidity_msat(*hop.source_node_id, blinding_point)
+		} else {
+			candidate.target().zip(candidate.short_channel_id()).and_then(|(target, scid)| {
+				self.inflight_htlcs.used_liquidity_msat(&candidate.source(), &target, scid)
+			})
+		};
+		Some(liquidity_msat.saturating_sub(used_liquidity_msat.unwrap_or(0)))
+	}
 }
 
 /// A data structure for tracking in-flight HTLCs. May be used during pathfinding to account for
@@ -2176,6 +2189,17 @@ fn calculate_blinded_path_intro_points<'a, L: Logger>(
 	Ok(introduction_node_id_cache)
 }
 
+/// Returns the capacity to route over `candidate` with, preferring the exact liquidity provided by
+/// `scorer`, if any, over the candidate's own [`EffectiveCapacity`].
+fn candidate_capacity<S: ScoreLookUp>(
+	candidate: &CandidateRouteHop, scorer: &S,
+) -> EffectiveCapacity {
+	match scorer.channel_liquidity_msat(candidate) {
+		Some(liquidity_msat) => EffectiveCapacity::ExactLiquidity { liquidity_msat },
+		None => candidate.effective_capacity(),
+	}
+}
+
 #[inline]
 #[rustfmt::skip]
 fn max_htlc_from_capacity(capacity: EffectiveCapacity, max_channel_saturation_power_of_half: u8) -> u64 {
@@ -2431,12 +2455,13 @@ impl<'a> PaymentPath<'a> {
 	/// Returns an error with the index of a later hop to discard if the following hops' aggregate
 	/// fees overflow.
 	#[rustfmt::skip]
-	fn max_final_value_msat(
-		&self, used_liquidities: &HashMap<CandidateHopId, u64>, channel_saturation_pow_half: u8
+	fn max_final_value_msat<S: ScoreLookUp>(
+		&self, used_liquidities: &HashMap<CandidateHopId, u64>, channel_saturation_pow_half: u8,
+		scorer: &S,
 	) -> Result<(usize, u64), usize> {
 		let mut max_path_contribution = (0, u64::MAX);
 		for (idx, (hop, _)) in self.hops.iter().enumerate() {
-			let hop_effective_capacity_msat = hop.candidate.effective_capacity();
+			let hop_effective_capacity_msat = candidate_capacity(&hop.candidate, scorer);
 			let hop_max_msat = max_htlc_from_capacity(
 				hop_effective_capacity_msat, channel_saturation_pow_half
 			).saturating_sub(*used_liquidities.get(&hop.candidate.id()).unwrap_or(&0_u64));
@@ -2992,7 +3017,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 			let src_node_id = $candidate.source();
 			if Some(src_node_id) != $candidate.target() {
 				let scid_opt = $candidate.short_channel_id();
-				let effective_capacity = $candidate.effective_capacity();
+				let effective_capacity = candidate_capacity($candidate, scorer);
 				let htlc_maximum_msat = max_htlc_from_capacity(effective_capacity, channel_saturation_pow_half);
 
 				// It is tricky to subtract $next_hops_fee_msat from available liquidity here.
@@ -3659,7 +3684,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 				// underpaid htlc_minimum_msat with fees.
 				debug_assert_eq!(payment_path.get_value_msat(), value_contribution_msat);
 				let (lowest_value_contrib_hop, max_path_contribution_msat) =
-					match payment_path.max_final_value_msat(&used_liquidities, channel_saturation_pow_half) {
+					match payment_path.max_final_value_msat(&used_liquidities, channel_saturation_pow_half, scorer) {
 						Ok(contribution) => contribution,
 						Err(candidate_idx_to_skip) => {
 							let candidate = &payment_path.hops[candidate_idx_to_skip].0.candidate;
@@ -3688,7 +3713,7 @@ pub(crate) fn get_route<L: Logger, S: ScoreLookUp>(
 						.entry(hop.candidate.id())
 						.and_modify(|used_liquidity_msat| *used_liquidity_msat += spent_on_hop_msat)
 						.or_insert(spent_on_hop_msat);
-					let hop_capacity = hop.candidate.effective_capacity();
+					let hop_capacity = candidate_capacity(&hop.candidate, scorer);
 					let hop_max_msat = max_htlc_from_capacity(hop_capacity, channel_saturation_pow_half);
 					debug_assert!(*used_liquidity_msat <= hop_max_msat);
 				}
@@ -9675,6 +9700,321 @@ mod tests {
 		assert_eq!(route.paths.len(), 1);
 		assert_eq!(route.paths[0].hops.len(), 2);
 		assert_eq!(route.paths[0].hops[1].short_channel_id, 16);
+	}
+
+	/// Reports the given exact liquidity for some channels (in both directions), applies the given
+	/// penalties, and records the [`ChannelUsage`]s it is asked to score.
+	struct LiquidityScorer {
+		liquidity_msat: HashMap<u64, u64>,
+		penalty_msat: HashMap<u64, u64>,
+		usages: Mutex<Vec<(u64, ChannelUsage)>>,
+	}
+
+	impl LiquidityScorer {
+		fn new(liquidity_msat: &[(u64, u64)], penalty_msat: &[(u64, u64)]) -> Self {
+			Self {
+				liquidity_msat: hash_map_from_iter(liquidity_msat.iter().copied()),
+				penalty_msat: hash_map_from_iter(penalty_msat.iter().copied()),
+				usages: Mutex::new(Vec::new()),
+			}
+		}
+
+		/// The effective capacities `channel_penalty_msat` was given for the channel `scid`.
+		fn scored_capacities(&self, scid: u64) -> Vec<EffectiveCapacity> {
+			let usages = self.usages.lock().unwrap();
+			usages.iter().filter(|(s, _)| *s == scid).map(|(_, u)| u.effective_capacity).collect()
+		}
+	}
+
+	#[cfg(c_bindings)]
+	impl Writeable for LiquidityScorer {
+		fn write<W: Writer>(&self, _w: &mut W) -> Result<(), crate::io::Error> {
+			unimplemented!()
+		}
+	}
+
+	impl ScoreLookUp for LiquidityScorer {
+		type ScoreParams = ();
+		fn channel_penalty_msat(
+			&self, candidate: &CandidateRouteHop, usage: ChannelUsage, _: &(),
+		) -> u64 {
+			let scid = candidate.short_channel_id().unwrap();
+			self.usages.lock().unwrap().push((scid, usage));
+			self.penalty_msat.get(&scid).copied().unwrap_or(0)
+		}
+
+		fn channel_liquidity_msat(&self, candidate: &CandidateRouteHop) -> Option<u64> {
+			self.liquidity_msat.get(&candidate.short_channel_id()?).copied()
+		}
+	}
+
+	impl crate::routing::scoring::ScoreUpdate for LiquidityScorer {
+		fn payment_path_failed(&mut self, _: &Path, _: u64, _: core::time::Duration) {}
+		fn payment_path_successful(&mut self, _: &Path, _: core::time::Duration) {}
+		fn probe_failed(&mut self, _: &Path, _: u64, _: core::time::Duration) {}
+		fn probe_successful(&mut self, _: &Path, _: core::time::Duration) {}
+		fn time_passed(&mut self, _: core::time::Duration) {}
+	}
+
+	#[cfg(c_bindings)]
+	impl crate::routing::scoring::Score for LiquidityScorer {}
+
+	/// Builds a graph in which an LSP (`nodes[0]`) has public channels to X (`nodes[1]`, SCID 1)
+	/// and Y (`nodes[2]`, SCID 2) with an `htlc_maximum_msat` of 1M msat, which in turn have
+	/// larger public channels to the payee (`nodes[3]`, SCIDs 3 and 4). No channel charges fees.
+	///
+	/// Returns the graph, its logger, our node id, our first hop to the LSP (SCID 42), and `nodes`.
+	fn build_lsp_graph() -> (
+		Arc<NetworkGraph<Arc<ln_test_utils::TestLogger>>>,
+		Arc<ln_test_utils::TestLogger>,
+		PublicKey,
+		ChannelDetails,
+		Vec<PublicKey>,
+	) {
+		let secp_ctx = Secp256k1::new();
+		let logger = Arc::new(ln_test_utils::TestLogger::new());
+		let network_graph = Arc::new(NetworkGraph::new(Network::Testnet, Arc::clone(&logger)));
+		let gossip_sync = P2PGossipSync::new(Arc::clone(&network_graph), None, Arc::clone(&logger));
+		let (_, our_id, privkeys, nodes) = get_nodes(&secp_ctx);
+
+		// (SCID, node one, node two, htlc_maximum_msat)
+		let channels = [
+			(1, 0, 1, 1_000_000),
+			(2, 0, 2, 1_000_000),
+			(3, 1, 3, 10_000_000),
+			(4, 2, 3, 10_000_000),
+		];
+		for (scid, node_one, node_two, htlc_maximum_msat) in channels {
+			let (privkey_one, privkey_two) = (&privkeys[node_one], &privkeys[node_two]);
+			let features = ChannelFeatures::empty();
+			add_channel(&gossip_sync, &secp_ctx, privkey_one, privkey_two, features, scid);
+			for (privkey, channel_flags) in [(privkey_one, 0), (privkey_two, 1)] {
+				let update = UnsignedChannelUpdate {
+					chain_hash: ChainHash::using_genesis_block(Network::Testnet),
+					short_channel_id: scid,
+					timestamp: 1,
+					message_flags: 1, // Only must_be_one
+					channel_flags,
+					cltv_expiry_delta: 0,
+					htlc_minimum_msat: 0,
+					htlc_maximum_msat,
+					fee_base_msat: 0,
+					fee_proportional_millionths: 0,
+					excess_data: Vec::new(),
+				};
+				update_channel(&gossip_sync, &secp_ctx, privkey, update);
+			}
+		}
+
+		let config = UserConfig::default();
+		let features = channelmanager::provided_init_features(&config);
+		let first_hop = get_channel_details(Some(42), nodes[0], features, 10_000_000);
+		(network_graph, logger, our_id, first_hop, nodes)
+	}
+
+	/// Returns the SCIDs and amount of each path of a fee-less `route`, sorted. As no channel
+	/// charges fees, every hop of a path carries the path's amount.
+	fn route_parts(route: &Route) -> Vec<(Vec<u64>, u64)> {
+		assert_eq!(route.get_total_fees(), 0);
+		let mut parts: Vec<_> = route
+			.paths
+			.iter()
+			.map(|path| {
+				let scids = path.hops.iter().map(|hop| hop.short_channel_id).collect();
+				(scids, path.final_value_msat())
+			})
+			.collect();
+		parts.sort_unstable();
+		parts
+	}
+
+	#[test]
+	fn channel_liquidity_single_path() {
+		// Check that a single-path payment only uses a hop whose `channel_liquidity_msat` covers
+		// the full amount, and that the scorer is given that liquidity as the hop's capacity.
+		let (network_graph, logger, our_id, first_hop, nodes) = build_lsp_graph();
+		let payment_params = PaymentParameters::from_node_id(nodes[3], 42).with_max_path_count(1);
+		let route_params = RouteParameters::from_payment_params_and_value(payment_params, 500_000);
+		let get_route_with = |scorer: &LiquidityScorer| {
+			let network_graph = network_graph.read_only();
+			let first_hops = [&first_hop];
+			let logger = Arc::clone(&logger);
+			get_route(
+				&our_id,
+				&route_params,
+				&network_graph,
+				Some(&first_hops),
+				logger,
+				scorer,
+				&(),
+				&[42; 32],
+			)
+		};
+		let via_x = vec![(vec![42, 1, 3], 500_000)];
+		let via_y = vec![(vec![42, 2, 4], 500_000)];
+		// Paying via Y is cheaper than via X.
+		let penalties = [(1, 1_000)];
+
+		let scorer = LiquidityScorer::new(&[], &penalties);
+		assert_eq!(route_parts(&get_route_with(&scorer).unwrap()), via_y);
+		let graph_capacity = EffectiveCapacity::AdvertisedMaxHTLC { amount_msat: 1_000_000 };
+		assert!(scorer.scored_capacities(2).iter().all(|capacity| *capacity == graph_capacity));
+
+		// If Y's liquidity is below the amount, we pay via X instead.
+		let scorer = LiquidityScorer::new(&[(2, 499_999)], &penalties);
+		assert_eq!(route_parts(&get_route_with(&scorer).unwrap()), via_x);
+
+		// If it is at or above the amount, we pay via Y, which is scored with that liquidity.
+		for liquidity_msat in [500_000, 600_000] {
+			let scorer = LiquidityScorer::new(&[(2, liquidity_msat)], &penalties);
+			assert_eq!(route_parts(&get_route_with(&scorer).unwrap()), via_y);
+			let capacities = scorer.scored_capacities(2);
+			assert!(!capacities.is_empty());
+			let exact_capacity = EffectiveCapacity::ExactLiquidity { liquidity_msat };
+			assert!(capacities.iter().all(|capacity| *capacity == exact_capacity));
+			let graph_capacity = EffectiveCapacity::AdvertisedMaxHTLC { amount_msat: 10_000_000 };
+			assert!(scorer.scored_capacities(4).iter().all(|capacity| *capacity == graph_capacity));
+		}
+
+		// A hop without liquidity is never used, even if it is cheaper.
+		let scorer = LiquidityScorer::new(&[(2, 0)], &penalties);
+		assert_eq!(route_parts(&get_route_with(&scorer).unwrap()), via_x);
+		assert!(scorer.scored_capacities(2).is_empty());
+
+		// If it is our only first hop, we can't pay at all.
+		let scorer = LiquidityScorer::new(&[(42, 0)], &penalties);
+		let err = get_route_with(&scorer).unwrap_err();
+		assert_eq!(err, "Failed to find a path to the given destination");
+	}
+
+	#[test]
+	fn channel_liquidity_mpp() {
+		// Check that MPP parts over a hop are sized by its `channel_liquidity_msat`, rather than by
+		// its (larger) capacity in the graph, both when finding and when trimming paths.
+		let (network_graph, logger, our_id, first_hop, nodes) = build_lsp_graph();
+		let config = UserConfig::default();
+		let mut payment_params = PaymentParameters::from_node_id(nodes[3], 42)
+			.with_bolt11_features(channelmanager::provided_bolt11_invoice_features(&config))
+			.unwrap();
+		let liquidity = [(1, 1_000_000), (2, 600_000)];
+
+		for max_channel_saturation_power_of_half in [0, 2] {
+			payment_params.max_channel_saturation_power_of_half =
+				max_channel_saturation_power_of_half;
+			let route_params =
+				RouteParameters::from_payment_params_and_value(payment_params.clone(), 1_500_000);
+			let get_route_with = |scorer: &LiquidityScorer| {
+				let network_graph = network_graph.read_only();
+				let first_hops = [&first_hop];
+				let logger = Arc::clone(&logger);
+				get_route(
+					&our_id,
+					&route_params,
+					&network_graph,
+					Some(&first_hops),
+					logger,
+					scorer,
+					&(),
+					&[42; 32],
+				)
+			};
+
+			// If X is cheaper, we use all of its liquidity, and pay the rest via Y.
+			let scorer = LiquidityScorer::new(&liquidity, &[(2, 1_000)]);
+			let route = get_route_with(&scorer).unwrap();
+			let parts = vec![(vec![42, 1, 3], 1_000_000), (vec![42, 2, 4], 500_000)];
+			assert_eq!(route_parts(&route), parts);
+
+			// If Y is cheaper, we use all of its liquidity and pay the rest via X. Y's part never
+			// exceeds its liquidity, though without the saturation limit its graph capacity would
+			// allow more.
+			let scorer = LiquidityScorer::new(&liquidity, &[(1, 1_000)]);
+			let route = get_route_with(&scorer).unwrap();
+			let parts = vec![(vec![42, 1, 3], 900_000), (vec![42, 2, 4], 600_000)];
+			assert_eq!(route_parts(&route), parts);
+			let exact_capacity = EffectiveCapacity::ExactLiquidity { liquidity_msat: 600_000 };
+			assert!(scorer.scored_capacities(2).iter().all(|capacity| *capacity == exact_capacity));
+
+			// If X and Y don't have enough liquidity together, we can't pay, though their graph
+			// capacity would suffice.
+			let scorer = LiquidityScorer::new(&[], &[]);
+			assert!(get_route_with(&scorer).is_ok());
+			let scorer = LiquidityScorer::new(&[(1, 1_000_000), (2, 499_999)], &[]);
+			let err = get_route_with(&scorer).unwrap_err();
+			assert_eq!(err, "Failed to find a sufficient route to the given destination");
+		}
+	}
+
+	#[test]
+	fn channel_liquidity_inflight() {
+		// Check that `ScorerAccountingForInFlightHtlcs` reduces a hop's `channel_liquidity_msat` by
+		// the HTLCs we already have in flight over it.
+		let (network_graph, logger, our_id, first_hop, nodes) = build_lsp_graph();
+		let config = UserConfig::default();
+		let payment_params = PaymentParameters::from_node_id(nodes[3], 42)
+			.with_bolt11_features(channelmanager::provided_bolt11_invoice_features(&config))
+			.unwrap();
+		let route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, 1_500_000);
+
+		let scorer = LiquidityScorer::new(&[(1, 1_000_000), (2, 600_000)], &[(1, 1_000)]);
+		let mut inflight_htlcs = InFlightHtlcs::new();
+		let (lsp, y) = (NodeId::from_pubkey(&nodes[0]), NodeId::from_pubkey(&nodes[2]));
+		inflight_htlcs.add_inflight_htlc(&lsp, &y, 2, 100_000);
+		// HTLCs in flight in the opposite direction don't use up our liquidity.
+		inflight_htlcs.add_inflight_htlc(&y, &lsp, 2, 200_000);
+		let inflight_scorer = ScorerAccountingForInFlightHtlcs::new(&scorer, &inflight_htlcs);
+
+		let route = get_route(
+			&our_id,
+			&route_params,
+			&network_graph.read_only(),
+			Some(&[&first_hop]),
+			Arc::clone(&logger),
+			&inflight_scorer,
+			&(),
+			&[42; 32],
+		)
+		.unwrap();
+		let parts = vec![(vec![42, 1, 3], 1_000_000), (vec![42, 2, 4], 500_000)];
+		assert_eq!(route_parts(&route), parts);
+		let lsp_to_y = EffectiveCapacity::ExactLiquidity { liquidity_msat: 500_000 };
+		let y_to_lsp = EffectiveCapacity::ExactLiquidity { liquidity_msat: 400_000 };
+		let capacities = scorer.scored_capacities(2);
+		assert!(capacities.contains(&lsp_to_y));
+		assert!(capacities.iter().all(|capacity| *capacity == lsp_to_y || *capacity == y_to_lsp));
+	}
+
+	#[test]
+	fn channel_liquidity_default_router() {
+		// Check that `DefaultRouter`, which reaches its scorer through a lock, honors the scorer's
+		// `channel_liquidity_msat`.
+		use crate::routing::router::{DefaultRouter, Router};
+		use crate::sign::RandomBytes;
+
+		let (network_graph, logger, our_id, first_hop, nodes) = build_lsp_graph();
+		let config = UserConfig::default();
+		let payment_params = PaymentParameters::from_node_id(nodes[3], 42)
+			.with_bolt11_features(channelmanager::provided_bolt11_invoice_features(&config))
+			.unwrap();
+		let route_params =
+			RouteParameters::from_payment_params_and_value(payment_params, 1_500_000);
+
+		let scorer = LiquidityScorer::new(&[(1, 1_000_000), (2, 600_000)], &[(1, 1_000)]);
+		#[cfg(not(c_bindings))]
+		let scorer = Arc::new(Mutex::new(scorer));
+		#[cfg(c_bindings)]
+		let scorer = Arc::new(crate::routing::scoring::MultiThreadedLockableScore::new(scorer));
+		let entropy_source = Arc::new(RandomBytes::new([42; 32]));
+		let router =
+			DefaultRouter::new(Arc::clone(&network_graph), logger, entropy_source, scorer, ());
+
+		let first_hops = [&first_hop];
+		let inflight_htlcs = InFlightHtlcs::new();
+		let route =
+			router.find_route(&our_id, &route_params, Some(&first_hops), inflight_htlcs).unwrap();
+		let parts = vec![(vec![42, 1, 3], 900_000), (vec![42, 2, 4], 600_000)];
+		assert_eq!(route_parts(&route), parts);
 	}
 }
 
