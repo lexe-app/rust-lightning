@@ -856,6 +856,15 @@ impl Peer {
 		self.their_features.is_some()
 	}
 
+	/// Returns true if broadcast gossip may be forwarded to this peer at all.
+	///
+	/// Lexe: upstream forwards all gossip to peers which don't support `gossip_queries`. We
+	/// forward them none: Lexe user nodes don't sync gossip over P2P, so they don't advertise
+	/// `gossip_queries`, and the LSP shouldn't send them any gossip.
+	fn accepts_gossip_broadcasts(&self) -> bool {
+		self.their_features.as_ref().map_or(false, |features| features.supports_gossip_queries())
+	}
+
 	/// Returns true if the channel announcements/updates for the given channel should be
 	/// forwarded to this peer.
 	/// If we are sending our routing table to this peer and we have not yet sent channel
@@ -2816,7 +2825,7 @@ impl<
 				let encoded_msg = encode_message(msg);
 				for (_, peer_mutex) in peers.iter() {
 					let mut peer = peer_mutex.lock().unwrap();
-					if !peer.handshake_complete() {
+					if !peer.accepts_gossip_broadcasts() {
 						continue;
 					}
 					if !our_channel && !peer.should_forward_channel_announcement(scid) {
@@ -2863,7 +2872,7 @@ impl<
 				let encoded_msg = encode_message(msg);
 				for (_, peer_mutex) in peers.iter() {
 					let mut peer = peer_mutex.lock().unwrap();
-					if !peer.handshake_complete() {
+					if !peer.accepts_gossip_broadcasts() {
 						continue;
 					}
 					if !our_announcement && !peer.should_forward_node_announcement(msg_node_id) {
@@ -2909,7 +2918,7 @@ impl<
 				let encoded_msg = encode_message(msg);
 				for (_, peer_mutex) in peers.iter() {
 					let mut peer = peer_mutex.lock().unwrap();
-					if !peer.handshake_complete() {
+					if !peer.accepts_gossip_broadcasts() {
 						continue;
 					}
 					if !our_channel && !peer.should_forward_channel_announcement(scid) {
