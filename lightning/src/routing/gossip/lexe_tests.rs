@@ -7,7 +7,8 @@
 // You may not use this file except in accordance with one or both of these
 // licenses.
 
-//! Lexe: tests for the fork's [`NetworkGraph`] additions: change tracking.
+//! Lexe: tests for the fork's [`NetworkGraph`] additions: change tracking, and setting channels
+//! and node announcements as received from a trusted source.
 
 use crate::ln::msgs::{BaseMessageHandler, RoutingMessageHandler, MAX_VALUE_MSAT};
 use crate::routing::gossip::tests::{
@@ -15,11 +16,12 @@ use crate::routing::gossip::tests::{
 	get_signed_channel_update, get_signed_node_announcement,
 };
 use crate::routing::gossip::{
-	GraphChanges, NetworkGraph, NodeId, NodeInfo, P2PGossipSync,
+	ChannelInfo, ChannelUpdateInfo, GraphChanges, NetworkGraph, NodeAlias, NodeAnnouncementDetails,
+	NodeAnnouncementInfo, NodeId, NodeInfo, P2PGossipSync, RoutingFees,
 	STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS,
 };
 use crate::routing::utxo::{UtxoFuture, UtxoResult};
-use crate::types::features::ChannelFeatures;
+use crate::types::features::{ChannelFeatures, NodeFeatures};
 use crate::util::logger::Logger;
 use crate::util::ser::{ReadableArgs, Writeable};
 use crate::util::test_utils;
@@ -470,4 +472,232 @@ fn change_tracking_drain_under_read_only_view() {
 	}
 	writer.join().unwrap();
 	assert_eq!(last_sent, Some(1000));
+}
+
+/// A channel with both directions, as received from a trusted source.
+fn get_channel_info(node_one: NodeId, node_two: NodeId, last_update: u32) -> ChannelInfo {
+	let direction = ChannelUpdateInfo {
+		htlc_minimum_msat: 1_000,
+		htlc_maximum_msat: 100_000_000,
+		fees: RoutingFees { base_msat: 1_000, proportional_millionths: 100 },
+		last_update,
+		cltv_expiry_delta: 144,
+		enabled: true,
+		last_update_message: None,
+	};
+	ChannelInfo {
+		features: ChannelFeatures::empty(),
+		node_one,
+		node_two,
+		// Placeholders, as `ChannelInfo::read` leaves them.
+		node_one_counter: u32::max_value(),
+		node_two_counter: u32::max_value(),
+		capacity_sats: Some(1_000_000),
+		one_to_two: Some(direction.clone()),
+		two_to_one: Some(direction),
+		announcement_message: None,
+		announcement_received_time: 1_000,
+	}
+}
+
+fn get_node_announcement_info(last_update: u32) -> NodeAnnouncementInfo {
+	NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
+		features: NodeFeatures::empty(),
+		last_update,
+		rgb: [1, 2, 3],
+		alias: NodeAlias([4; 32]),
+		addresses: Vec::new(),
+	})
+}
+
+/// Returns `node_id`'s channels, sorted, if it exists.
+fn get_node_channels<L: Logger>(
+	network_graph: &NetworkGraph<L>, node_id: &NodeId,
+) -> Option<Vec<u64>> {
+	let mut channels = network_graph.read_only().node(node_id)?.channels.clone();
+	channels.sort_unstable();
+	Some(channels)
+}
+
+fn get_node_announcement<L: Logger>(
+	network_graph: &NetworkGraph<L>, node_id: &NodeId,
+) -> Option<NodeAnnouncementInfo> {
+	network_graph.read_only().node(node_id).unwrap().announcement_info.clone()
+}
+
+#[test]
+fn set_channel_new_scid() {
+	let network_graph = create_tracked_network_graph();
+	let (_, nodes) = get_nodes(&Secp256k1::new(), 3);
+
+	// Creates both endpoints.
+	let info = get_channel_info(nodes[0], nodes[1], 100);
+	network_graph.set_channel(7, info.clone());
+	assert_changes(&network_graph, &[7], &[nodes[0], nodes[1]]);
+	assert_eq!(network_graph.read_only().channel(7), Some(&info));
+	assert_eq!(get_node_channels(&network_graph, &nodes[0]), Some(vec![7]));
+	assert_eq!(get_node_announcement(&network_graph, &nodes[0]), None);
+
+	// Links to an existing endpoint.
+	let info = get_channel_info(nodes[2], nodes[0], 100);
+	network_graph.set_channel(8, info.clone());
+	assert_changes(&network_graph, &[8], &[nodes[0], nodes[2]]);
+	assert_eq!(network_graph.read_only().channel(8), Some(&info));
+	assert_eq!(get_node_channels(&network_graph, &nodes[0]), Some(vec![7, 8]));
+	assert_eq!(get_node_channels(&network_graph, &nodes[2]), Some(vec![8]));
+
+	// The channels' node counters were set to their endpoints'.
+	network_graph.test_node_counter_consistency();
+}
+
+#[test]
+fn set_channel_same_endpoints() {
+	let network_graph = create_tracked_network_graph();
+	let (_, nodes) = get_nodes(&Secp256k1::new(), 2);
+	network_graph.set_channel(7, get_channel_info(nodes[0], nodes[1], 100));
+	let announcement = get_node_announcement_info(100);
+	network_graph.set_node_announcement(&nodes[0], Some(announcement.clone()));
+	let channel = network_graph.read_only().channel(7).unwrap().clone();
+	let counters = (channel.node_one_counter, channel.node_two_counter);
+	network_graph.drain_changes();
+
+	// An equal record changes nothing.
+	network_graph.set_channel(7, get_channel_info(nodes[0], nodes[1], 100));
+	assert_changes(&network_graph, &[], &[]);
+
+	// Replaced in place, even with an older direction, a cleared direction, and a new capacity.
+	let mut info = get_channel_info(nodes[0], nodes[1], 50);
+	info.two_to_one = None;
+	info.capacity_sats = Some(2_000_000);
+	network_graph.set_channel(7, info.clone());
+	assert_changes(&network_graph, &[7], &[]);
+	let channel = network_graph.read_only().channel(7).unwrap().clone();
+	assert_eq!(channel, info);
+	assert_eq!((channel.node_one_counter, channel.node_two_counter), counters);
+	assert_eq!(get_node_channels(&network_graph, &nodes[0]), Some(vec![7]));
+	assert_eq!(get_node_announcement(&network_graph, &nodes[0]), Some(announcement));
+	network_graph.test_node_counter_consistency();
+}
+
+#[test]
+fn set_channel_different_endpoints() {
+	let network_graph = create_tracked_network_graph();
+	let (pubkeys, nodes) = get_nodes(&Secp256k1::new(), 4);
+	network_graph.set_channel(7, get_channel_info(nodes[0], nodes[1], 100));
+	network_graph.set_channel(8, get_channel_info(nodes[1], nodes[2], 100));
+	for node_id in &nodes[..3] {
+		network_graph.set_node_announcement(node_id, Some(get_node_announcement_info(100)));
+	}
+	network_graph.drain_changes();
+
+	// E.g. after a reorg, with older directions than the old channel's. Node 0 is left without
+	// channels and removed, while nodes 1 and 2 keep channel 8 and their announcements.
+	let info = get_channel_info(nodes[2], nodes[3], 50);
+	network_graph.set_channel(7, info.clone());
+	assert_changes(&network_graph, &[7], &nodes);
+	assert_eq!(network_graph.read_only().channel(7), Some(&info));
+	assert_eq!(get_node_channels(&network_graph, &nodes[0]), None);
+	assert_eq!(get_node_channels(&network_graph, &nodes[1]), Some(vec![8]));
+	assert_eq!(get_node_channels(&network_graph, &nodes[2]), Some(vec![7, 8]));
+	assert_eq!(get_node_channels(&network_graph, &nodes[3]), Some(vec![7]));
+	assert!(get_node_announcement(&network_graph, &nodes[1]).is_some());
+	assert!(get_node_announcement(&network_graph, &nodes[2]).is_some());
+	network_graph.test_node_counter_consistency();
+
+	// Swapped endpoints are relinked too. Node 3 has no other channel, so it's recreated
+	// without its announcement, as when gossip replaces a channel.
+	network_graph.set_node_announcement(&nodes[3], Some(get_node_announcement_info(100)));
+	network_graph.drain_changes();
+	let info = get_channel_info(nodes[3], nodes[2], 50);
+	network_graph.set_channel(7, info.clone());
+	assert_changes(&network_graph, &[7], &[nodes[2], nodes[3]]);
+	assert_eq!(network_graph.read_only().channel(7), Some(&info));
+	assert_eq!(get_node_channels(&network_graph, &nodes[2]), Some(vec![7, 8]));
+	assert_eq!(get_node_channels(&network_graph, &nodes[3]), Some(vec![7]));
+	assert_eq!(get_node_announcement(&network_graph, &nodes[3]), None);
+	network_graph.test_node_counter_consistency();
+
+	// Removals follow the new links.
+	network_graph.channel_failed_permanent(7);
+	assert_changes(&network_graph, &[7], &[nodes[2], nodes[3]]);
+	assert_eq!(get_node_channels(&network_graph, &nodes[2]), Some(vec![8]));
+	assert_eq!(get_node_channels(&network_graph, &nodes[3]), None);
+	network_graph.node_failed_permanent(&pubkeys[1]);
+	assert_changes(&network_graph, &[8], &[nodes[1], nodes[2]]);
+	assert!(network_graph.read_only().channels().is_empty());
+	assert!(network_graph.read_only().nodes().is_empty());
+	network_graph.test_node_counter_consistency();
+}
+
+#[test]
+fn set_channel_after_permanent_failure() {
+	let network_graph = create_tracked_network_graph();
+	let (pubkeys, nodes) = get_nodes(&Secp256k1::new(), 3);
+	network_graph.set_channel(7, get_channel_info(nodes[0], nodes[1], 100));
+	network_graph.set_channel(8, get_channel_info(nodes[1], nodes[2], 100));
+	network_graph.channel_failed_permanent(7);
+	network_graph.node_failed_permanent(&pubkeys[1]);
+	assert!(network_graph.read_only().channels().is_empty());
+	network_graph.drain_changes();
+
+	// The trusted source wins over the removal of both the SCID and an endpoint.
+	let info = get_channel_info(nodes[0], nodes[1], 100);
+	network_graph.set_channel(7, info.clone());
+	assert_changes(&network_graph, &[7], &[nodes[0], nodes[1]]);
+	assert_eq!(network_graph.read_only().channel(7), Some(&info));
+	network_graph.set_channel(7, info);
+	assert_changes(&network_graph, &[], &[]);
+	network_graph.test_node_counter_consistency();
+
+	// The removals are still tracked, so gossip can't re-add them.
+	assert!(network_graph.removed_channels.lock().unwrap().contains_key(&7));
+	assert!(network_graph.removed_nodes.lock().unwrap().contains_key(&nodes[1]));
+}
+
+#[test]
+fn set_channel_with_itself_is_ignored() {
+	let network_graph = create_tracked_network_graph();
+	let (_, nodes) = get_nodes(&Secp256k1::new(), 2);
+	network_graph.set_channel(7, get_channel_info(nodes[0], nodes[0], 100));
+	assert_changes(&network_graph, &[], &[]);
+	assert!(network_graph.read_only().channels().is_empty());
+	assert!(network_graph.read_only().nodes().is_empty());
+
+	// An existing channel is kept.
+	let info = get_channel_info(nodes[0], nodes[1], 100);
+	network_graph.set_channel(7, info.clone());
+	network_graph.drain_changes();
+	network_graph.set_channel(7, get_channel_info(nodes[1], nodes[1], 100));
+	assert_changes(&network_graph, &[], &[]);
+	assert_eq!(network_graph.read_only().channel(7), Some(&info));
+}
+
+#[test]
+fn set_node_announcement() {
+	let network_graph = create_tracked_network_graph();
+	let (_, nodes) = get_nodes(&Secp256k1::new(), 3);
+	network_graph.set_channel(7, get_channel_info(nodes[0], nodes[1], 100));
+	network_graph.drain_changes();
+
+	// Sets an announcement, even an older one, unless it's equal.
+	for last_update in [100, 50] {
+		let announcement = get_node_announcement_info(last_update);
+		network_graph.set_node_announcement(&nodes[0], Some(announcement.clone()));
+		assert_eq!(get_node_announcement(&network_graph, &nodes[0]), Some(announcement));
+	}
+	assert_changes(&network_graph, &[], &[nodes[0]]);
+	network_graph.set_node_announcement(&nodes[0], Some(get_node_announcement_info(50)));
+	assert_changes(&network_graph, &[], &[]);
+
+	// Clears it.
+	network_graph.set_node_announcement(&nodes[0], None);
+	assert_changes(&network_graph, &[], &[nodes[0]]);
+	assert_eq!(get_node_announcement(&network_graph, &nodes[0]), None);
+	network_graph.set_node_announcement(&nodes[0], None);
+	assert_changes(&network_graph, &[], &[]);
+
+	// Nodes only exist while they have channels.
+	network_graph.set_node_announcement(&nodes[2], Some(get_node_announcement_info(100)));
+	assert_changes(&network_graph, &[], &[]);
+	assert!(network_graph.read_only().node(&nodes[2]).is_none());
 }

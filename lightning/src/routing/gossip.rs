@@ -2118,30 +2118,7 @@ impl<L: Logger> NetworkGraph<L> {
 			IndexedMapEntry::Vacant(entry) => entry.insert(channel_info),
 		};
 
-		let mut node_counter_id = [
-			(&mut channel_info.node_one_counter, node_id_a),
-			(&mut channel_info.node_two_counter, node_id_b),
-		];
-		for (chan_info_node_counter, current_node_id) in node_counter_id.iter_mut() {
-			match nodes.entry(current_node_id.clone()) {
-				IndexedMapEntry::Occupied(node_entry) => {
-					let node = node_entry.into_mut();
-					node.channels.push(short_channel_id);
-					**chan_info_node_counter = node.node_counter;
-				},
-				IndexedMapEntry::Vacant(node_entry) => {
-					let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
-					**chan_info_node_counter = removed_node_counters.pop().unwrap_or_else(|| {
-						self.next_node_counter.fetch_add(1, Ordering::Relaxed) as u32
-					});
-					node_entry.insert(NodeInfo {
-						channels: vec![short_channel_id],
-						announcement_info: None,
-						node_counter: **chan_info_node_counter,
-					});
-				},
-			};
-		}
+		self.link_channel_to_nodes(&mut nodes, short_channel_id, channel_info);
 		self.track_changes(&[short_channel_id], &[node_id_a, node_id_b]);
 
 		core::mem::drop(nodes);
@@ -2835,6 +2812,80 @@ impl<L: Logger> NetworkGraph<L> {
 		}
 	}
 
+	/// Sets `short_channel_id`'s channel info to `info`, as received from a trusted source which
+	/// already validated it. Performs no signature, UTXO, timestamp, or removed-channel checks.
+	///
+	/// Keeps the endpoints' node entries (and their announcements) if the endpoints are
+	/// unchanged, and relinks them otherwise. Use [`Self::channel_failed_permanent`] to remove a
+	/// channel.
+	///
+	/// Ignores a channel with itself, keeping any existing channel with this SCID, as the graph
+	/// couldn't remove it again.
+	///
+	/// This sets the state as of the call: gossip applied to the same graph later, including
+	/// announcements still awaiting a UTXO lookup, may overwrite it. So a graph kept in sync with
+	/// a trusted source shouldn't also be fed gossip.
+	///
+	/// Lexe: fork-only. Lets a replica apply the current state of a channel in the trusted
+	/// source's graph exactly, e.g. one recorded by the source's change tracking.
+	pub fn set_channel(&self, short_channel_id: u64, mut info: ChannelInfo) {
+		if info.node_one == info.node_two {
+			// Removing it would visit the same node twice, and panic once the first visit
+			// removed it.
+			log_error!(self.logger, "Ignoring channel {} with itself", short_channel_id);
+			return;
+		}
+
+		// Any node counters in `info`, e.g. the placeholders `ChannelInfo::read` sets, are
+		// replaced with the endpoints' below.
+		let mut channels = self.channels.write().unwrap();
+		if let Some(channel) = channels.get_mut(&short_channel_id) {
+			if channel.node_one == info.node_one && channel.node_two == info.node_two {
+				// Note that `ChannelInfo`'s equality ignores node counters.
+				if *channel != info {
+					info.node_one_counter = channel.node_one_counter;
+					info.node_two_counter = channel.node_two_counter;
+					*channel = info;
+					self.track_changes(&[short_channel_id], &[]);
+				}
+				return;
+			}
+		}
+
+		let mut nodes = self.nodes.write().unwrap();
+		let channel = match channels.entry(short_channel_id) {
+			IndexedMapEntry::Occupied(mut entry) => {
+				self.remove_channel_in_nodes(&mut nodes, entry.get(), short_channel_id);
+				self.track_changes(&[], &[entry.get().node_one, entry.get().node_two]);
+				*entry.get_mut() = info;
+				entry.into_mut()
+			},
+			IndexedMapEntry::Vacant(entry) => entry.insert(info),
+		};
+		self.link_channel_to_nodes(&mut nodes, short_channel_id, channel);
+		self.track_changes(&[short_channel_id], &[channel.node_one, channel.node_two]);
+
+		core::mem::drop(nodes);
+		core::mem::drop(channels);
+		self.test_node_counter_consistency();
+	}
+
+	/// Sets or clears an existing node's announcement info, as received from a trusted source.
+	/// Does nothing if the node doesn't exist: nodes are added and removed with their channels.
+	///
+	/// Like [`Self::set_channel`], this sets the state as of the call.
+	///
+	/// Lexe: fork-only, see [`Self::set_channel`].
+	pub fn set_node_announcement(&self, node_id: &NodeId, info: Option<NodeAnnouncementInfo>) {
+		let mut nodes = self.nodes.write().unwrap();
+		if let Some(node) = nodes.get_mut(node_id) {
+			if node.announcement_info != info {
+				node.announcement_info = info;
+				self.track_changes(&[], &[*node_id]);
+			}
+		}
+	}
+
 	/// Records that `channels` and `nodes` changed, if change tracking is enabled.
 	///
 	/// Must be called before releasing the graph lock(s) used to make the changes.
@@ -2843,6 +2894,41 @@ impl<L: Logger> NetworkGraph<L> {
 			let mut changes = changes.lock().unwrap();
 			changes.channels.extend(channels);
 			changes.nodes.extend(nodes);
+		}
+	}
+
+	/// Adds `short_channel_id` to the channel lists of `channel_info`'s endpoints, creating any
+	/// which don't exist yet without an announcement, and sets `channel_info`'s node counters to
+	/// theirs.
+	///
+	/// Lexe: moved out of `add_channel_between_nodes` to share it with [`Self::set_channel`].
+	fn link_channel_to_nodes(
+		&self, nodes: &mut IndexedMap<NodeId, NodeInfo>, short_channel_id: u64,
+		channel_info: &mut ChannelInfo,
+	) {
+		let mut node_counter_id = [
+			(&mut channel_info.node_one_counter, channel_info.node_one),
+			(&mut channel_info.node_two_counter, channel_info.node_two),
+		];
+		for (chan_info_node_counter, current_node_id) in node_counter_id.iter_mut() {
+			match nodes.entry(current_node_id.clone()) {
+				IndexedMapEntry::Occupied(node_entry) => {
+					let node = node_entry.into_mut();
+					node.channels.push(short_channel_id);
+					**chan_info_node_counter = node.node_counter;
+				},
+				IndexedMapEntry::Vacant(node_entry) => {
+					let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
+					**chan_info_node_counter = removed_node_counters.pop().unwrap_or_else(|| {
+						self.next_node_counter.fetch_add(1, Ordering::Relaxed) as u32
+					});
+					node_entry.insert(NodeInfo {
+						channels: vec![short_channel_id],
+						announcement_info: None,
+						node_counter: **chan_info_node_counter,
+					});
+				},
+			};
 		}
 	}
 }
