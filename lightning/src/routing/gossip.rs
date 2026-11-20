@@ -1639,6 +1639,16 @@ const MIN_SERIALIZATION_VERSION: u8 = 1;
 
 impl<L: Logger> Writeable for NetworkGraph<L> {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.write_internal(writer, false)
+	}
+}
+
+impl<L: Logger> NetworkGraph<L> {
+	/// Lexe: the [`Writeable`] impl's body, which can also write each channel and node with only
+	/// what payment routing needs, for [`Self::write_for_routing_only`].
+	fn write_internal<W: Writer>(
+		&self, writer: &mut W, routing_only: bool,
+	) -> Result<(), io::Error> {
 		self.test_node_counter_consistency();
 
 		write_ver_prefix!(writer, SERIALIZATION_VERSION, MIN_SERIALIZATION_VERSION);
@@ -1648,13 +1658,21 @@ impl<L: Logger> Writeable for NetworkGraph<L> {
 		(channels.len() as u64).write(writer)?;
 		for (ref chan_id, ref chan_info) in channels.unordered_iter() {
 			(*chan_id).write(writer)?;
-			chan_info.write(writer)?;
+			if routing_only {
+				chan_info.to_routing_only().write(writer)?;
+			} else {
+				chan_info.write(writer)?;
+			}
 		}
 		let nodes = self.nodes.read().unwrap();
 		(nodes.len() as u64).write(writer)?;
 		for (ref node_id, ref node_info) in nodes.unordered_iter() {
 			node_id.write(writer)?;
-			node_info.write(writer)?;
+			if routing_only {
+				node_info.to_routing_only().write(writer)?;
+			} else {
+				node_info.write(writer)?;
+			}
 		}
 
 		let last_rapid_gossip_sync_timestamp = self.get_last_rapid_gossip_sync_timestamp();
@@ -2774,6 +2792,79 @@ impl ReadOnlyNetworkGraph<'_> {
 	}
 }
 
+impl ChannelInfo {
+	/// A copy with only what payment routing needs, i.e. without the stored channel announcement
+	/// and channel updates.
+	///
+	/// Lexe: fork-only.
+	pub fn to_routing_only(&self) -> ChannelInfo {
+		ChannelInfo {
+			features: self.features.clone(),
+			node_one: self.node_one,
+			node_two: self.node_two,
+			node_one_counter: self.node_one_counter,
+			node_two_counter: self.node_two_counter,
+			capacity_sats: self.capacity_sats,
+			one_to_two: self.one_to_two.as_ref().map(ChannelUpdateInfo::to_routing_only),
+			two_to_one: self.two_to_one.as_ref().map(ChannelUpdateInfo::to_routing_only),
+			announcement_message: None,
+			announcement_received_time: self.announcement_received_time,
+		}
+	}
+}
+
+impl ChannelUpdateInfo {
+	/// A copy with only what payment routing needs, i.e. without the stored channel update.
+	///
+	/// Lexe: fork-only.
+	fn to_routing_only(&self) -> ChannelUpdateInfo {
+		ChannelUpdateInfo {
+			htlc_minimum_msat: self.htlc_minimum_msat,
+			htlc_maximum_msat: self.htlc_maximum_msat,
+			fees: self.fees,
+			last_update: self.last_update,
+			cltv_expiry_delta: self.cltv_expiry_delta,
+			enabled: self.enabled,
+			last_update_message: None,
+		}
+	}
+}
+
+impl NodeAnnouncementInfo {
+	/// A copy with only what payment routing needs, i.e. as [`NodeAnnouncementInfo::Local`],
+	/// without the stored node announcement, and without addresses.
+	///
+	/// Note that without addresses, e.g. [`DefaultMessageRouter`] can't find an address to open a
+	/// new connection to the node to send it an onion message, nor tell whether it's reachable
+	/// only over Tor.
+	///
+	/// Lexe: fork-only.
+	///
+	/// [`DefaultMessageRouter`]: crate::onion_message::messenger::DefaultMessageRouter
+	pub fn to_routing_only(&self) -> NodeAnnouncementInfo {
+		NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
+			features: self.features().clone(),
+			last_update: self.last_update(),
+			rgb: self.rgb(),
+			alias: *self.alias(),
+			addresses: Vec::new(),
+		})
+	}
+}
+
+impl NodeInfo {
+	/// A copy with only what payment routing needs, see [`NodeAnnouncementInfo::to_routing_only`].
+	///
+	/// Lexe: fork-only.
+	fn to_routing_only(&self) -> NodeInfo {
+		NodeInfo {
+			channels: self.channels.clone(),
+			announcement_info: self.announcement_info.as_ref().map(|a| a.to_routing_only()),
+			node_counter: self.node_counter,
+		}
+	}
+}
+
 /// The channels and nodes of a [`NetworkGraph`] that changed, recorded while change tracking is
 /// enabled.
 ///
@@ -2884,6 +2975,16 @@ impl<L: Logger> NetworkGraph<L> {
 				self.track_changes(&[], &[*node_id]);
 			}
 		}
+	}
+
+	/// Writes this graph like its [`Writeable`] impl, but with only what payment routing needs:
+	/// without stored gossip messages or node addresses, see [`ChannelInfo::to_routing_only`] and
+	/// [`NodeAnnouncementInfo::to_routing_only`]. Readable by any [`NetworkGraph`] reader.
+	///
+	/// Lexe: fork-only. A much smaller snapshot for replicas which only route over the graph, and
+	/// never serve its gossip to peers or connect to its nodes.
+	pub fn write_for_routing_only<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.write_internal(writer, true)
 	}
 
 	/// Records that `channels` and `nodes` changed, if change tracking is enabled.
