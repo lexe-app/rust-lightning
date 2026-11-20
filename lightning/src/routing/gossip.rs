@@ -190,6 +190,8 @@ pub struct NetworkGraph<L: Logger> {
 	chain_hash: ChainHash,
 	logger: L,
 	// Lock order: channels -> nodes
+	//
+	// Lexe: `changes` is always locked last, after `channels`, `nodes`, and the `removed_*` locks.
 	channels: RwLock<IndexedMap<u64, ChannelInfo>>,
 	nodes: RwLock<IndexedMap<NodeId, NodeInfo>>,
 	removed_node_counters: Mutex<Vec<u32>>,
@@ -215,6 +217,9 @@ pub struct NetworkGraph<L: Logger> {
 	removed_nodes: Mutex<HashMap<NodeId, Option<u64>>>,
 	/// Announcement messages which are awaiting an on-chain lookup to be processed.
 	pub(super) pending_checks: utxo::PendingChecks,
+	/// Lexe: the changes recorded since the last [`Self::drain_changes`], or `None` if change
+	/// tracking is disabled.
+	changes: Option<Mutex<GraphChanges>>,
 }
 
 /// A read-only view of [`NetworkGraph`].
@@ -1725,6 +1730,7 @@ impl<L: Logger> ReadableArgs<L> for NetworkGraph<L> {
 			removed_nodes: Mutex::new(new_hash_map()),
 			removed_channels: Mutex::new(new_hash_map()),
 			pending_checks: utxo::PendingChecks::new(),
+			changes: None,
 		})
 	}
 }
@@ -1821,6 +1827,7 @@ impl<L: Logger> NetworkGraph<L> {
 			removed_channels: Mutex::new(new_hash_map()),
 			removed_nodes: Mutex::new(new_hash_map()),
 			pending_checks: utxo::PendingChecks::new(),
+			changes: None,
 		}
 	}
 
@@ -1984,6 +1991,7 @@ impl<L: Logger> NetworkGraph<L> {
 							addresses: msg.addresses.clone(),
 						}))
 					};
+				self.track_changes(&[], &[msg.node_id]);
 
 				Ok(())
 			},
@@ -2097,6 +2105,7 @@ impl<L: Logger> NetworkGraph<L> {
 					//    get reorg'd out.
 					// c) it's unclear how to do so without exposing ourselves to massive DoS risk.
 					self.remove_channel_in_nodes(&mut nodes, &entry.get(), short_channel_id);
+					self.track_changes(&[], &[entry.get().node_one, entry.get().node_two]);
 					*entry.get_mut() = channel_info;
 					entry.into_mut()
 				} else {
@@ -2133,6 +2142,7 @@ impl<L: Logger> NetworkGraph<L> {
 				},
 			};
 		}
+		self.track_changes(&[short_channel_id], &[node_id_a, node_id_b]);
 
 		core::mem::drop(nodes);
 		core::mem::drop(channels);
@@ -2284,6 +2294,7 @@ impl<L: Logger> NetworkGraph<L> {
 			let mut nodes = self.nodes.write().unwrap();
 			self.removed_channels.lock().unwrap().insert(short_channel_id, current_time_unix);
 			self.remove_channel_in_nodes(&mut nodes, &chan, short_channel_id);
+			self.track_changes(&[short_channel_id], &[chan.node_one, chan.node_two]);
 		}
 	}
 
@@ -2305,6 +2316,9 @@ impl<L: Logger> NetworkGraph<L> {
 
 		if let Some(node) = nodes.remove(&node_id) {
 			let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
+			// Lexe: the removed channels and nodes, for change tracking.
+			let tracking = self.changes.is_some();
+			let (mut changed_scids, mut changed_nodes) = (Vec::new(), Vec::new());
 			for scid in node.channels.iter() {
 				if let Some(chan_info) = channels.remove(scid) {
 					let other_node_id = if node_id == chan_info.node_one {
@@ -2322,12 +2336,20 @@ impl<L: Logger> NetworkGraph<L> {
 						}
 					}
 					removed_channels.insert(*scid, current_time_unix);
+					if tracking {
+						changed_scids.push(*scid);
+						changed_nodes.push(other_node_id);
+					}
 				} else {
 					debug_assert!(false, "Channels in nodes must always have channel info");
 				}
 			}
 			removed_node_counters.push(node.node_counter);
 			removed_nodes.insert(node_id, current_time_unix);
+			if tracking {
+				changed_nodes.push(node_id);
+			}
+			self.track_changes(&changed_scids, &changed_nodes);
 		}
 	}
 
@@ -2384,6 +2406,11 @@ impl<L: Logger> NetworkGraph<L> {
 		}
 		let min_time_unix: u32 = (current_time_unix - STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS) as u32;
 		let mut scids_to_remove = new_hash_set();
+		// Lexe: channels with a cleared direction, and removed channels and their endpoints, for
+		// change tracking.
+		let tracking = self.changes.is_some();
+		let mut changed_scids = Vec::new();
+		let mut changed_nodes = Vec::new();
 		for (scid, info) in channels.unordered_iter_mut() {
 			if info.one_to_two.is_some()
 				&& info.one_to_two.as_ref().unwrap().last_update < min_time_unix
@@ -2391,6 +2418,9 @@ impl<L: Logger> NetworkGraph<L> {
 				log_gossip!(self.logger, "Removing directional update one_to_two (0) for channel {} due to its timestamp {} being below {}",
 					scid, info.one_to_two.as_ref().unwrap().last_update, min_time_unix);
 				info.one_to_two = None;
+				if tracking {
+					changed_scids.push(*scid);
+				}
 			}
 			if info.two_to_one.is_some()
 				&& info.two_to_one.as_ref().unwrap().last_update < min_time_unix
@@ -2398,6 +2428,9 @@ impl<L: Logger> NetworkGraph<L> {
 				log_gossip!(self.logger, "Removing directional update two_to_one (1) for channel {} due to its timestamp {} being below {}",
 					scid, info.two_to_one.as_ref().unwrap().last_update, min_time_unix);
 				info.two_to_one = None;
+				if tracking {
+					changed_scids.push(*scid);
+				}
 			}
 			if info.one_to_two.is_none() || info.two_to_one.is_none() {
 				// We check the announcement_received_time here to ensure we don't drop
@@ -2423,9 +2456,15 @@ impl<L: Logger> NetworkGraph<L> {
 					nodes_to_remove.insert(*e.key());
 				});
 				removed_channels_lck.insert(scid, Some(current_time_unix));
+				if tracking {
+					changed_scids.push(scid);
+					changed_nodes.extend([info.node_one, info.node_two]);
+				}
 			}
 			nodes.remove_bulk(&nodes_to_remove);
 		}
+		// Still under the `channels` write lock, which `read_only` views take first.
+		self.track_changes(&changed_scids, &changed_nodes);
 
 		let should_keep_tracking = |time: &mut Option<u64>| {
 			if let Some(time) = time {
@@ -2665,6 +2704,7 @@ impl<L: Logger> NetworkGraph<L> {
 			} else {
 				channel.one_to_two = new_channel_info;
 			}
+			self.track_changes(&[msg.short_channel_id], &[]);
 
 			Ok(Some((channel.node_one, channel.node_two)))
 		} else {
@@ -2757,6 +2797,59 @@ impl ReadOnlyNetworkGraph<'_> {
 	}
 }
 
+/// The channels and nodes of a [`NetworkGraph`] that changed, recorded while change tracking is
+/// enabled.
+///
+/// Lexe: fork-only, see [`NetworkGraph::enable_change_tracking`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphChanges {
+	/// Channels which were added, replaced, updated in either direction (including directions
+	/// cleared by pruning), or removed.
+	pub channels: HashSet<u64>,
+	/// Nodes whose announcement info changed, or which gained or lost a channel.
+	pub nodes: HashSet<NodeId>,
+}
+
+impl<L: Logger> NetworkGraph<L> {
+	/// Starts recording [`GraphChanges`], taken with [`Self::drain_changes`]. Not persisted.
+	///
+	/// Only actual changes to the graph's channels and nodes are recorded, e.g. gossip rejected as
+	/// a duplicate or as outdated records nothing.
+	///
+	/// Lexe: fork-only. Lets a trusted source, e.g. an LSP, send the current state of everything
+	/// that changed to replicas of its graph.
+	pub fn enable_change_tracking(&mut self) {
+		self.changes.get_or_insert_with(|| Mutex::new(GraphChanges::default()));
+	}
+
+	/// Takes the changes recorded since the last call. Empty if change tracking is disabled.
+	///
+	/// Changes are recorded before the graph's locks are released, so every change drained while
+	/// holding a [`Self::read_only`] view is reflected in that view.
+	///
+	/// Lexe: fork-only.
+	pub fn drain_changes(&self) -> GraphChanges {
+		match &self.changes {
+			Some(changes) => core::mem::take(&mut *changes.lock().unwrap()),
+			None => GraphChanges::default(),
+		}
+	}
+
+	/// Records that `channels` and `nodes` changed, if change tracking is enabled.
+	///
+	/// Must be called before releasing the graph lock(s) used to make the changes.
+	fn track_changes(&self, channels: &[u64], nodes: &[NodeId]) {
+		if let Some(changes) = &self.changes {
+			let mut changes = changes.lock().unwrap();
+			changes.channels.extend(channels);
+			changes.nodes.extend(nodes);
+		}
+	}
+}
+
+#[cfg(test)]
+mod lexe_tests;
+
 #[cfg(test)]
 pub(crate) mod tests {
 	use crate::ln::chan_utils::make_funding_redeemscript;
@@ -2800,12 +2893,12 @@ pub(crate) mod tests {
 	use crate::sync::Arc;
 	use bitcoin::secp256k1;
 
-	fn create_network_graph() -> NetworkGraph<Arc<test_utils::TestLogger>> {
+	pub(crate) fn create_network_graph() -> NetworkGraph<Arc<test_utils::TestLogger>> {
 		let logger = Arc::new(test_utils::TestLogger::new());
 		NetworkGraph::new(Network::Testnet, logger)
 	}
 
-	fn create_gossip_sync(
+	pub(crate) fn create_gossip_sync(
 		network_graph: &NetworkGraph<Arc<test_utils::TestLogger>>,
 	) -> (
 		Secp256k1<All>,
