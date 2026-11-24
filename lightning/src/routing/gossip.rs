@@ -190,6 +190,8 @@ pub struct NetworkGraph<L: Logger> {
 	chain_hash: ChainHash,
 	logger: L,
 	// Lock order: channels -> nodes
+	//
+	// Lexe: `changes` is always locked last, after `channels`, `nodes`, and the `removed_*` locks.
 	channels: RwLock<IndexedMap<u64, ChannelInfo>>,
 	nodes: RwLock<IndexedMap<NodeId, NodeInfo>>,
 	removed_node_counters: Mutex<Vec<u32>>,
@@ -215,6 +217,9 @@ pub struct NetworkGraph<L: Logger> {
 	removed_nodes: Mutex<HashMap<NodeId, Option<u64>>>,
 	/// Announcement messages which are awaiting an on-chain lookup to be processed.
 	pub(super) pending_checks: utxo::PendingChecks,
+	/// Lexe: the changes recorded since the last [`Self::drain_changes`], or `None` if change
+	/// tracking is disabled.
+	changes: Option<Mutex<GraphChanges>>,
 }
 
 /// A read-only view of [`NetworkGraph`].
@@ -1634,6 +1639,16 @@ const MIN_SERIALIZATION_VERSION: u8 = 1;
 
 impl<L: Logger> Writeable for NetworkGraph<L> {
 	fn write<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.write_internal(writer, false)
+	}
+}
+
+impl<L: Logger> NetworkGraph<L> {
+	/// Lexe: the [`Writeable`] impl's body, which can also write each channel and node with only
+	/// what payment routing needs, for [`Self::write_for_routing_only`].
+	fn write_internal<W: Writer>(
+		&self, writer: &mut W, routing_only: bool,
+	) -> Result<(), io::Error> {
 		self.test_node_counter_consistency();
 
 		write_ver_prefix!(writer, SERIALIZATION_VERSION, MIN_SERIALIZATION_VERSION);
@@ -1643,13 +1658,21 @@ impl<L: Logger> Writeable for NetworkGraph<L> {
 		(channels.len() as u64).write(writer)?;
 		for (ref chan_id, ref chan_info) in channels.unordered_iter() {
 			(*chan_id).write(writer)?;
-			chan_info.write(writer)?;
+			if routing_only {
+				chan_info.to_routing_only().write(writer)?;
+			} else {
+				chan_info.write(writer)?;
+			}
 		}
 		let nodes = self.nodes.read().unwrap();
 		(nodes.len() as u64).write(writer)?;
 		for (ref node_id, ref node_info) in nodes.unordered_iter() {
 			node_id.write(writer)?;
-			node_info.write(writer)?;
+			if routing_only {
+				node_info.to_routing_only().write(writer)?;
+			} else {
+				node_info.write(writer)?;
+			}
 		}
 
 		let last_rapid_gossip_sync_timestamp = self.get_last_rapid_gossip_sync_timestamp();
@@ -1725,6 +1748,7 @@ impl<L: Logger> ReadableArgs<L> for NetworkGraph<L> {
 			removed_nodes: Mutex::new(new_hash_map()),
 			removed_channels: Mutex::new(new_hash_map()),
 			pending_checks: utxo::PendingChecks::new(),
+			changes: None,
 		})
 	}
 }
@@ -1821,6 +1845,7 @@ impl<L: Logger> NetworkGraph<L> {
 			removed_channels: Mutex::new(new_hash_map()),
 			removed_nodes: Mutex::new(new_hash_map()),
 			pending_checks: utxo::PendingChecks::new(),
+			changes: None,
 		}
 	}
 
@@ -1984,6 +2009,7 @@ impl<L: Logger> NetworkGraph<L> {
 							addresses: msg.addresses.clone(),
 						}))
 					};
+				self.track_changes(&[], &[msg.node_id]);
 
 				Ok(())
 			},
@@ -2097,6 +2123,7 @@ impl<L: Logger> NetworkGraph<L> {
 					//    get reorg'd out.
 					// c) it's unclear how to do so without exposing ourselves to massive DoS risk.
 					self.remove_channel_in_nodes(&mut nodes, &entry.get(), short_channel_id);
+					self.track_changes(&[], &[entry.get().node_one, entry.get().node_two]);
 					*entry.get_mut() = channel_info;
 					entry.into_mut()
 				} else {
@@ -2109,30 +2136,8 @@ impl<L: Logger> NetworkGraph<L> {
 			IndexedMapEntry::Vacant(entry) => entry.insert(channel_info),
 		};
 
-		let mut node_counter_id = [
-			(&mut channel_info.node_one_counter, node_id_a),
-			(&mut channel_info.node_two_counter, node_id_b),
-		];
-		for (chan_info_node_counter, current_node_id) in node_counter_id.iter_mut() {
-			match nodes.entry(current_node_id.clone()) {
-				IndexedMapEntry::Occupied(node_entry) => {
-					let node = node_entry.into_mut();
-					node.channels.push(short_channel_id);
-					**chan_info_node_counter = node.node_counter;
-				},
-				IndexedMapEntry::Vacant(node_entry) => {
-					let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
-					**chan_info_node_counter = removed_node_counters.pop().unwrap_or_else(|| {
-						self.next_node_counter.fetch_add(1, Ordering::Relaxed) as u32
-					});
-					node_entry.insert(NodeInfo {
-						channels: vec![short_channel_id],
-						announcement_info: None,
-						node_counter: **chan_info_node_counter,
-					});
-				},
-			};
-		}
+		self.link_channel_to_nodes(&mut nodes, short_channel_id, channel_info);
+		self.track_changes(&[short_channel_id], &[node_id_a, node_id_b]);
 
 		core::mem::drop(nodes);
 		core::mem::drop(channels);
@@ -2284,6 +2289,7 @@ impl<L: Logger> NetworkGraph<L> {
 			let mut nodes = self.nodes.write().unwrap();
 			self.removed_channels.lock().unwrap().insert(short_channel_id, current_time_unix);
 			self.remove_channel_in_nodes(&mut nodes, &chan, short_channel_id);
+			self.track_changes(&[short_channel_id], &[chan.node_one, chan.node_two]);
 		}
 	}
 
@@ -2305,6 +2311,9 @@ impl<L: Logger> NetworkGraph<L> {
 
 		if let Some(node) = nodes.remove(&node_id) {
 			let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
+			// Lexe: the removed channels and nodes, for change tracking.
+			let tracking = self.changes.is_some();
+			let (mut changed_scids, mut changed_nodes) = (Vec::new(), Vec::new());
 			for scid in node.channels.iter() {
 				if let Some(chan_info) = channels.remove(scid) {
 					let other_node_id = if node_id == chan_info.node_one {
@@ -2322,12 +2331,20 @@ impl<L: Logger> NetworkGraph<L> {
 						}
 					}
 					removed_channels.insert(*scid, current_time_unix);
+					if tracking {
+						changed_scids.push(*scid);
+						changed_nodes.push(other_node_id);
+					}
 				} else {
 					debug_assert!(false, "Channels in nodes must always have channel info");
 				}
 			}
 			removed_node_counters.push(node.node_counter);
 			removed_nodes.insert(node_id, current_time_unix);
+			if tracking {
+				changed_nodes.push(node_id);
+			}
+			self.track_changes(&changed_scids, &changed_nodes);
 		}
 	}
 
@@ -2384,6 +2401,11 @@ impl<L: Logger> NetworkGraph<L> {
 		}
 		let min_time_unix: u32 = (current_time_unix - STALE_CHANNEL_UPDATE_AGE_LIMIT_SECS) as u32;
 		let mut scids_to_remove = new_hash_set();
+		// Lexe: channels with a cleared direction, and removed channels and their endpoints, for
+		// change tracking.
+		let tracking = self.changes.is_some();
+		let mut changed_scids = Vec::new();
+		let mut changed_nodes = Vec::new();
 		for (scid, info) in channels.unordered_iter_mut() {
 			if info.one_to_two.is_some()
 				&& info.one_to_two.as_ref().unwrap().last_update < min_time_unix
@@ -2391,6 +2413,9 @@ impl<L: Logger> NetworkGraph<L> {
 				log_gossip!(self.logger, "Removing directional update one_to_two (0) for channel {} due to its timestamp {} being below {}",
 					scid, info.one_to_two.as_ref().unwrap().last_update, min_time_unix);
 				info.one_to_two = None;
+				if tracking {
+					changed_scids.push(*scid);
+				}
 			}
 			if info.two_to_one.is_some()
 				&& info.two_to_one.as_ref().unwrap().last_update < min_time_unix
@@ -2398,6 +2423,9 @@ impl<L: Logger> NetworkGraph<L> {
 				log_gossip!(self.logger, "Removing directional update two_to_one (1) for channel {} due to its timestamp {} being below {}",
 					scid, info.two_to_one.as_ref().unwrap().last_update, min_time_unix);
 				info.two_to_one = None;
+				if tracking {
+					changed_scids.push(*scid);
+				}
 			}
 			if info.one_to_two.is_none() || info.two_to_one.is_none() {
 				// We check the announcement_received_time here to ensure we don't drop
@@ -2423,9 +2451,15 @@ impl<L: Logger> NetworkGraph<L> {
 					nodes_to_remove.insert(*e.key());
 				});
 				removed_channels_lck.insert(scid, Some(current_time_unix));
+				if tracking {
+					changed_scids.push(scid);
+					changed_nodes.extend([info.node_one, info.node_two]);
+				}
 			}
 			nodes.remove_bulk(&nodes_to_remove);
 		}
+		// Still under the `channels` write lock, which `read_only` views take first.
+		self.track_changes(&changed_scids, &changed_nodes);
 
 		let should_keep_tracking = |time: &mut Option<u64>| {
 			if let Some(time) = time {
@@ -2665,6 +2699,7 @@ impl<L: Logger> NetworkGraph<L> {
 			} else {
 				channel.one_to_two = new_channel_info;
 			}
+			self.track_changes(&[msg.short_channel_id], &[]);
 
 			Ok(Some((channel.node_one, channel.node_two)))
 		} else {
@@ -2757,6 +2792,251 @@ impl ReadOnlyNetworkGraph<'_> {
 	}
 }
 
+impl ChannelInfo {
+	/// A copy with only what payment routing needs, i.e. without the stored channel announcement
+	/// and channel updates.
+	///
+	/// Lexe: fork-only.
+	pub fn to_routing_only(&self) -> ChannelInfo {
+		ChannelInfo {
+			features: self.features.clone(),
+			node_one: self.node_one,
+			node_two: self.node_two,
+			node_one_counter: self.node_one_counter,
+			node_two_counter: self.node_two_counter,
+			capacity_sats: self.capacity_sats,
+			one_to_two: self.one_to_two.as_ref().map(ChannelUpdateInfo::to_routing_only),
+			two_to_one: self.two_to_one.as_ref().map(ChannelUpdateInfo::to_routing_only),
+			announcement_message: None,
+			announcement_received_time: self.announcement_received_time,
+		}
+	}
+}
+
+impl ChannelUpdateInfo {
+	/// A copy with only what payment routing needs, i.e. without the stored channel update.
+	///
+	/// Lexe: fork-only.
+	fn to_routing_only(&self) -> ChannelUpdateInfo {
+		ChannelUpdateInfo {
+			htlc_minimum_msat: self.htlc_minimum_msat,
+			htlc_maximum_msat: self.htlc_maximum_msat,
+			fees: self.fees,
+			last_update: self.last_update,
+			cltv_expiry_delta: self.cltv_expiry_delta,
+			enabled: self.enabled,
+			last_update_message: None,
+		}
+	}
+}
+
+impl NodeAnnouncementInfo {
+	/// A copy with only what payment routing needs, i.e. as [`NodeAnnouncementInfo::Local`],
+	/// without the stored node announcement, and without addresses.
+	///
+	/// Note that without addresses, e.g. [`DefaultMessageRouter`] can't find an address to open a
+	/// new connection to the node to send it an onion message, nor tell whether it's reachable
+	/// only over Tor.
+	///
+	/// Lexe: fork-only.
+	///
+	/// [`DefaultMessageRouter`]: crate::onion_message::messenger::DefaultMessageRouter
+	pub fn to_routing_only(&self) -> NodeAnnouncementInfo {
+		NodeAnnouncementInfo::Local(NodeAnnouncementDetails {
+			features: self.features().clone(),
+			last_update: self.last_update(),
+			rgb: self.rgb(),
+			alias: *self.alias(),
+			addresses: Vec::new(),
+		})
+	}
+}
+
+impl NodeInfo {
+	/// A copy with only what payment routing needs, see [`NodeAnnouncementInfo::to_routing_only`].
+	///
+	/// Lexe: fork-only.
+	fn to_routing_only(&self) -> NodeInfo {
+		NodeInfo {
+			channels: self.channels.clone(),
+			announcement_info: self.announcement_info.as_ref().map(|a| a.to_routing_only()),
+			node_counter: self.node_counter,
+		}
+	}
+}
+
+/// The channels and nodes of a [`NetworkGraph`] that changed, recorded while change tracking is
+/// enabled.
+///
+/// Lexe: fork-only, see [`NetworkGraph::enable_change_tracking`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphChanges {
+	/// Channels which were added, replaced, updated in either direction (including directions
+	/// cleared by pruning), or removed.
+	pub channels: HashSet<u64>,
+	/// Nodes whose announcement info changed, or which gained or lost a channel.
+	pub nodes: HashSet<NodeId>,
+}
+
+impl<L: Logger> NetworkGraph<L> {
+	/// Starts recording [`GraphChanges`], taken with [`Self::drain_changes`]. Not persisted.
+	///
+	/// Only actual changes to the graph's channels and nodes are recorded, e.g. gossip rejected as
+	/// a duplicate or as outdated records nothing.
+	///
+	/// Lexe: fork-only. Lets a trusted source, e.g. an LSP, send the current state of everything
+	/// that changed to replicas of its graph.
+	pub fn enable_change_tracking(&mut self) {
+		self.changes.get_or_insert_with(|| Mutex::new(GraphChanges::default()));
+	}
+
+	/// Takes the changes recorded since the last call. Empty if change tracking is disabled.
+	///
+	/// Changes are recorded before the graph's locks are released, so every change drained while
+	/// holding a [`Self::read_only`] view is reflected in that view.
+	///
+	/// Lexe: fork-only.
+	pub fn drain_changes(&self) -> GraphChanges {
+		match &self.changes {
+			Some(changes) => core::mem::take(&mut *changes.lock().unwrap()),
+			None => GraphChanges::default(),
+		}
+	}
+
+	/// Sets `short_channel_id`'s channel info to `info`, as received from a trusted source which
+	/// already validated it. Performs no signature, UTXO, timestamp, or removed-channel checks.
+	///
+	/// Keeps the endpoints' node entries (and their announcements) if the endpoints are
+	/// unchanged, and relinks them otherwise. Use [`Self::channel_failed_permanent`] to remove a
+	/// channel.
+	///
+	/// Ignores a channel with itself, keeping any existing channel with this SCID, as the graph
+	/// couldn't remove it again.
+	///
+	/// This sets the state as of the call: gossip applied to the same graph later, including
+	/// announcements still awaiting a UTXO lookup, may overwrite it. So a graph kept in sync with
+	/// a trusted source shouldn't also be fed gossip.
+	///
+	/// Lexe: fork-only. Lets a replica apply the current state of a channel in the trusted
+	/// source's graph exactly, e.g. one recorded by the source's change tracking.
+	pub fn set_channel(&self, short_channel_id: u64, mut info: ChannelInfo) {
+		if info.node_one == info.node_two {
+			// Removing it would visit the same node twice, and panic once the first visit
+			// removed it.
+			log_error!(self.logger, "Ignoring channel {} with itself", short_channel_id);
+			return;
+		}
+
+		// Any node counters in `info`, e.g. the placeholders `ChannelInfo::read` sets, are
+		// replaced with the endpoints' below.
+		let mut channels = self.channels.write().unwrap();
+		if let Some(channel) = channels.get_mut(&short_channel_id) {
+			if channel.node_one == info.node_one && channel.node_two == info.node_two {
+				// Note that `ChannelInfo`'s equality ignores node counters.
+				if *channel != info {
+					info.node_one_counter = channel.node_one_counter;
+					info.node_two_counter = channel.node_two_counter;
+					*channel = info;
+					self.track_changes(&[short_channel_id], &[]);
+				}
+				return;
+			}
+		}
+
+		let mut nodes = self.nodes.write().unwrap();
+		let channel = match channels.entry(short_channel_id) {
+			IndexedMapEntry::Occupied(mut entry) => {
+				self.remove_channel_in_nodes(&mut nodes, entry.get(), short_channel_id);
+				self.track_changes(&[], &[entry.get().node_one, entry.get().node_two]);
+				*entry.get_mut() = info;
+				entry.into_mut()
+			},
+			IndexedMapEntry::Vacant(entry) => entry.insert(info),
+		};
+		self.link_channel_to_nodes(&mut nodes, short_channel_id, channel);
+		self.track_changes(&[short_channel_id], &[channel.node_one, channel.node_two]);
+
+		core::mem::drop(nodes);
+		core::mem::drop(channels);
+		self.test_node_counter_consistency();
+	}
+
+	/// Sets or clears an existing node's announcement info, as received from a trusted source.
+	/// Does nothing if the node doesn't exist: nodes are added and removed with their channels.
+	///
+	/// Like [`Self::set_channel`], this sets the state as of the call.
+	///
+	/// Lexe: fork-only, see [`Self::set_channel`].
+	pub fn set_node_announcement(&self, node_id: &NodeId, info: Option<NodeAnnouncementInfo>) {
+		let mut nodes = self.nodes.write().unwrap();
+		if let Some(node) = nodes.get_mut(node_id) {
+			if node.announcement_info != info {
+				node.announcement_info = info;
+				self.track_changes(&[], &[*node_id]);
+			}
+		}
+	}
+
+	/// Writes this graph like its [`Writeable`] impl, but with only what payment routing needs:
+	/// without stored gossip messages or node addresses, see [`ChannelInfo::to_routing_only`] and
+	/// [`NodeAnnouncementInfo::to_routing_only`]. Readable by any [`NetworkGraph`] reader.
+	///
+	/// Lexe: fork-only. A much smaller snapshot for replicas which only route over the graph, and
+	/// never serve its gossip to peers or connect to its nodes.
+	pub fn write_for_routing_only<W: Writer>(&self, writer: &mut W) -> Result<(), io::Error> {
+		self.write_internal(writer, true)
+	}
+
+	/// Records that `channels` and `nodes` changed, if change tracking is enabled.
+	///
+	/// Must be called before releasing the graph lock(s) used to make the changes.
+	fn track_changes(&self, channels: &[u64], nodes: &[NodeId]) {
+		if let Some(changes) = &self.changes {
+			let mut changes = changes.lock().unwrap();
+			changes.channels.extend(channels);
+			changes.nodes.extend(nodes);
+		}
+	}
+
+	/// Adds `short_channel_id` to the channel lists of `channel_info`'s endpoints, creating any
+	/// which don't exist yet without an announcement, and sets `channel_info`'s node counters to
+	/// theirs.
+	///
+	/// Lexe: moved out of `add_channel_between_nodes` to share it with [`Self::set_channel`].
+	fn link_channel_to_nodes(
+		&self, nodes: &mut IndexedMap<NodeId, NodeInfo>, short_channel_id: u64,
+		channel_info: &mut ChannelInfo,
+	) {
+		let mut node_counter_id = [
+			(&mut channel_info.node_one_counter, channel_info.node_one),
+			(&mut channel_info.node_two_counter, channel_info.node_two),
+		];
+		for (chan_info_node_counter, current_node_id) in node_counter_id.iter_mut() {
+			match nodes.entry(current_node_id.clone()) {
+				IndexedMapEntry::Occupied(node_entry) => {
+					let node = node_entry.into_mut();
+					node.channels.push(short_channel_id);
+					**chan_info_node_counter = node.node_counter;
+				},
+				IndexedMapEntry::Vacant(node_entry) => {
+					let mut removed_node_counters = self.removed_node_counters.lock().unwrap();
+					**chan_info_node_counter = removed_node_counters.pop().unwrap_or_else(|| {
+						self.next_node_counter.fetch_add(1, Ordering::Relaxed) as u32
+					});
+					node_entry.insert(NodeInfo {
+						channels: vec![short_channel_id],
+						announcement_info: None,
+						node_counter: **chan_info_node_counter,
+					});
+				},
+			};
+		}
+	}
+}
+
+#[cfg(test)]
+mod lexe_tests;
+
 #[cfg(test)]
 pub(crate) mod tests {
 	use crate::ln::chan_utils::make_funding_redeemscript;
@@ -2800,12 +3080,12 @@ pub(crate) mod tests {
 	use crate::sync::Arc;
 	use bitcoin::secp256k1;
 
-	fn create_network_graph() -> NetworkGraph<Arc<test_utils::TestLogger>> {
+	pub(crate) fn create_network_graph() -> NetworkGraph<Arc<test_utils::TestLogger>> {
 		let logger = Arc::new(test_utils::TestLogger::new());
 		NetworkGraph::new(Network::Testnet, logger)
 	}
 
-	fn create_gossip_sync(
+	pub(crate) fn create_gossip_sync(
 		network_graph: &NetworkGraph<Arc<test_utils::TestLogger>>,
 	) -> (
 		Secp256k1<All>,
